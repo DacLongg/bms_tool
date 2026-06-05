@@ -1,0 +1,634 @@
+"""BMS UART protocol helpers.
+
+The protocol is derived from reference/bms_uart.h and reference/bms_uart.c.
+Frame format:
+    AA 55 CMD LEN PAYLOAD CRC_LO CRC_HI
+
+CRC is CRC16/Modbus over CMD, LEN and PAYLOAD.
+Responses use CMD | 0x80 and have a status byte as the first payload byte.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import struct
+from typing import Dict, Iterable, List, Optional
+
+
+SOF0 = 0xAA
+SOF1 = 0x55
+RESPONSE_FLAG = 0x80
+PROTOCOL_VERSION = 0x04
+MAX_PAYLOAD_SIZE = 64
+OTP_WRITE_MAGIC = b"OTP!"
+
+CMD_PING = 0x01
+CMD_READ_SUMMARY = 0x10
+CMD_READ_CELLS = 0x11
+CMD_READ_FAULTS = 0x12
+CMD_READ_LIMITS = 0x13
+CMD_OTP_CHECK = 0x20
+CMD_OTP_WRITE = 0x21
+CMD_OTP_READ = 0x22
+CMD_CALIBRATE_CURRENT = 0x30
+
+COMMAND_NAMES = {
+    CMD_PING: "PING",
+    CMD_READ_SUMMARY: "READ_SUMMARY",
+    CMD_READ_CELLS: "READ_CELLS",
+    CMD_READ_FAULTS: "READ_FAULTS",
+    CMD_READ_LIMITS: "READ_LIMITS",
+    CMD_OTP_CHECK: "OTP_CHECK",
+    CMD_OTP_WRITE: "OTP_WRITE",
+    CMD_OTP_READ: "OTP_READ",
+    CMD_CALIBRATE_CURRENT: "CALIBRATE_CURRENT",
+}
+
+STATUS_OK = 0x00
+STATUS_BAD_LENGTH = 0x01
+STATUS_BAD_COMMAND = 0x02
+STATUS_BUSY = 0x03
+STATUS_INTERNAL_ERROR = 0x04
+STATUS_BAD_PAYLOAD = 0x05
+
+STATUS_NAMES = {
+    STATUS_OK: "OK",
+    STATUS_BAD_LENGTH: "BAD_LENGTH",
+    STATUS_BAD_COMMAND: "BAD_COMMAND",
+    STATUS_BUSY: "BUSY",
+    STATUS_INTERNAL_ERROR: "INTERNAL_ERROR",
+    STATUS_BAD_PAYLOAD: "BAD_PAYLOAD",
+}
+
+STATE_NAMES = {
+    0: "INIT",
+    1: "NORMAL",
+    2: "CHARGE_PROTECT",
+    3: "DISCHARGE_PROTECT",
+    4: "FAULT",
+}
+
+CURRENT_DIRECTION_NAMES = {
+    0: "IDLE",
+    1: "CHARGE",
+    2: "DISCHARGE",
+}
+
+FAULT_NAMES = [
+    "Cell over voltage",
+    "Cell under voltage",
+    "Charge over temperature",
+    "Discharge over temperature",
+    "Under temperature",
+    "Charge over current",
+    "Discharge over current",
+    "Short circuit",
+    "BQ safety fault",
+    "Communication fault",
+]
+
+GATE_SIGNAL_NAMES = [
+    "DCHG pin active",
+    "DDSG pin active",
+]
+
+FET_NAMES = [
+    "FETs enabled",
+    "Charge FET enabled",
+    "Discharge FET enabled",
+    "Charge disabled",
+    "Discharge disabled",
+    "FETOFF asserted",
+]
+
+OTP_FLAG_NAMES = [
+    "Full access OK",
+    "Config update OK",
+    "OTP check OK",
+    "OTP write OK",
+    "OTP blocked",
+    "OTP pending",
+    "DCHG active high",
+    "DDSG active high",
+    "DA user volts",
+    "OTP result lock",
+    "OTP result no signature",
+    "OTP result no data",
+    "OTP result high temperature",
+    "OTP result low voltage",
+    "OTP result high voltage",
+    "OTP write failed",
+]
+
+CALIBRATION_STATUS_NAMES = {
+    0: "OK",
+    1: "BAD_INPUT",
+    2: "ZERO_READING",
+    3: "DEVIATION_TOO_HIGH",
+    4: "WRITE_FAILED",
+}
+
+
+class ProtocolError(Exception):
+    """Base protocol exception."""
+
+
+class BmsStatusError(ProtocolError):
+    """Raised when the device returns a non-OK status."""
+
+    def __init__(self, command: int, status: int, data: bytes = b"") -> None:
+        self.command = command
+        self.status = status
+        self.data = data
+        command_name = COMMAND_NAMES.get(command, f"0x{command:02X}")
+        status_name = STATUS_NAMES.get(status, f"0x{status:02X}")
+        super().__init__(f"{command_name} returned {status_name}")
+
+
+class PayloadTooLargeError(ProtocolError):
+    """Raised when a request payload cannot fit in one protocol frame."""
+
+
+@dataclass(frozen=True)
+class Frame:
+    command: int
+    payload: bytes
+
+
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+            crc &= 0xFFFF
+    return crc
+
+
+def build_frame(command: int, payload: bytes = b"") -> bytes:
+    if not 0 <= command <= 0xFF:
+        raise ValueError("command must fit in one byte")
+    if len(payload) > MAX_PAYLOAD_SIZE:
+        raise PayloadTooLargeError(
+            f"payload length {len(payload)} exceeds firmware limit {MAX_PAYLOAD_SIZE}"
+        )
+    header = bytes([SOF0, SOF1, command, len(payload)])
+    crc = crc16_modbus(bytes([command, len(payload)]) + payload)
+    return header + payload + struct.pack("<H", crc)
+
+
+class FrameParser:
+    """Streaming parser for BMS UART frames."""
+
+    def __init__(self, max_payload: int = 255) -> None:
+        self.max_payload = max_payload
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> List[Frame]:
+        self._buffer.extend(data)
+        frames: List[Frame] = []
+
+        while True:
+            if len(self._buffer) < 2:
+                return frames
+
+            try:
+                sof_index = self._buffer.index(SOF0)
+            except ValueError:
+                self._buffer.clear()
+                return frames
+
+            if sof_index:
+                del self._buffer[:sof_index]
+
+            if len(self._buffer) < 4:
+                return frames
+
+            if self._buffer[1] != SOF1:
+                del self._buffer[0]
+                continue
+
+            length = self._buffer[3]
+            if length > self.max_payload:
+                del self._buffer[0]
+                continue
+
+            frame_length = 6 + length
+            if len(self._buffer) < frame_length:
+                return frames
+
+            raw = bytes(self._buffer[:frame_length])
+            del self._buffer[:frame_length]
+
+            command = raw[2]
+            payload = raw[4 : 4 + length]
+            received_crc = struct.unpack_from("<H", raw, 4 + length)[0]
+            calculated_crc = crc16_modbus(raw[2 : 4 + length])
+            if received_crc == calculated_crc:
+                frames.append(Frame(command, payload))
+
+        return frames
+
+
+def decode_response(request_command: int, response: Frame) -> bytes:
+    expected_command = request_command | RESPONSE_FLAG
+    if response.command != expected_command:
+        got = f"0x{response.command:02X}"
+        expected = f"0x{expected_command:02X}"
+        raise ProtocolError(f"unexpected response command {got}, expected {expected}")
+    if not response.payload:
+        raise ProtocolError("response payload is missing the status byte")
+
+    status = response.payload[0]
+    data = response.payload[1:]
+    if status != STATUS_OK:
+        raise BmsStatusError(request_command, status, data)
+    return data
+
+
+def make_calibration_payload(actual_ma: int) -> bytes:
+    return struct.pack("<i", int(actual_ma))
+
+
+def active_flag_names(bitmap: int, names: Iterable[str]) -> List[str]:
+    return [name for bit, name in enumerate(names) if bitmap & (1 << bit)]
+
+
+class PayloadReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def remaining(self) -> int:
+        return len(self.data) - self.pos
+
+    def require(self, size: int) -> None:
+        if self.remaining() < size:
+            raise ProtocolError(
+                f"payload too short at offset {self.pos}; need {size}, have {self.remaining()}"
+            )
+
+    def u8(self) -> int:
+        self.require(1)
+        value = self.data[self.pos]
+        self.pos += 1
+        return value
+
+    def bool(self) -> bool:
+        return self.u8() != 0
+
+    def u16(self) -> int:
+        self.require(2)
+        value = struct.unpack_from("<H", self.data, self.pos)[0]
+        self.pos += 2
+        return value
+
+    def i16(self) -> int:
+        self.require(2)
+        value = struct.unpack_from("<h", self.data, self.pos)[0]
+        self.pos += 2
+        return value
+
+    def u32(self) -> int:
+        self.require(4)
+        value = struct.unpack_from("<I", self.data, self.pos)[0]
+        self.pos += 4
+        return value
+
+    def i32(self) -> int:
+        self.require(4)
+        value = struct.unpack_from("<i", self.data, self.pos)[0]
+        self.pos += 4
+        return value
+
+    def u64(self) -> int:
+        self.require(8)
+        value = struct.unpack_from("<Q", self.data, self.pos)[0]
+        self.pos += 8
+        return value
+
+
+def _u8(data: bytes, offset: int) -> int:
+    return data[offset]
+
+
+def _bool(data: bytes, offset: int) -> bool:
+    return _u8(data, offset) != 0
+
+
+def _u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _i16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<h", data, offset)[0]
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _i32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<i", data, offset)[0]
+
+
+def _u64(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _fault_bitmap_from_bools(values: Iterable[bool]) -> int:
+    bitmap = 0
+    for bit, active in enumerate(values):
+        if active:
+            bitmap |= 1 << bit
+    return bitmap
+
+
+def _fet_bitmap_from_summary(summary: Dict[str, object]) -> int:
+    bitmap = 0
+    bitmap |= (1 << 0) if summary.get("fets_enabled") else 0
+    bitmap |= (1 << 1) if summary.get("charge_fet_enabled") else 0
+    bitmap |= (1 << 2) if summary.get("discharge_fet_enabled") else 0
+    bitmap |= (1 << 3) if summary.get("charge_disabled") else 0
+    bitmap |= (1 << 4) if summary.get("discharge_disabled") else 0
+    bitmap |= (1 << 5) if summary.get("fetoff_asserted") else 0
+    return bitmap
+
+
+def parse_cells(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    count = reader.u8()
+    voltages = [reader.u16() for _ in range(count)]
+    return {
+        "cell_count": count,
+        "cell_voltages_mV": voltages,
+        "min_cell_voltage_mV": min(voltages) if voltages else None,
+        "max_cell_voltage_mV": max(voltages) if voltages else None,
+        "average_cell_voltage_mV": round(sum(voltages) / len(voltages), 1)
+        if voltages
+        else None,
+        "delta_cell_voltage_mV": (max(voltages) - min(voltages)) if voltages else None,
+    }
+
+
+def parse_faults(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    fault_bitmap = reader.u16()
+    gate_signal_bitmap = reader.u8()
+    alert_active = reader.bool()
+    alert_counter = reader.u32()
+    return {
+        "fault_bitmap": fault_bitmap,
+        "faults": active_flag_names(fault_bitmap, FAULT_NAMES),
+        "gate_signal_bitmap": gate_signal_bitmap,
+        "gate_signals": active_flag_names(gate_signal_bitmap, GATE_SIGNAL_NAMES),
+        "alert_active": alert_active,
+        "alert_counter": alert_counter,
+    }
+
+
+def parse_limits(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    return {
+        "cell_count": reader.u8(),
+        "thermistor_count": reader.u8(),
+        "cell_ov_cutoff_mV": reader.u16(),
+        "cell_ov_recover_mV": reader.u16(),
+        "cell_uv_cutoff_mV": reader.u16(),
+        "cell_uv_recover_mV": reader.u16(),
+        "balance_delta_mV": reader.u16(),
+        "balance_min_cell_mV": reader.u16(),
+        "over_current_mA": reader.i32(),
+        "short_circuit_mA": reader.i32(),
+        "charge_ot_cutoff_C": reader.i16(),
+        "discharge_ot_cutoff_C": reader.i16(),
+        "undertemp_cutoff_C": reader.i16(),
+        "nominal_capacity_mAh": reader.u32(),
+    }
+
+
+def parse_otp_status(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    flags = reader.u16()
+    result = {
+        "flags": flags,
+        "flag_names": active_flag_names(flags, OTP_FLAG_NAMES),
+        "security_state": reader.u8(),
+        "check_result": reader.u8(),
+        "check_data_fail_addr": reader.u16(),
+        "write_result": reader.u8(),
+        "write_data_fail_addr": reader.u16(),
+        "battery_status_raw": reader.u16(),
+        "static_config_signature": reader.u16(),
+        "stack_voltage_mV": reader.u16(),
+        "pack_voltage_mV": reader.u16(),
+        "internal_temp_C": reader.i16(),
+        "reg0_config": reader.u8(),
+        "reg12_control": reader.u8(),
+        "da_config": reader.u8(),
+        "vcell_mode": reader.u16(),
+        "dchg_pin_config": reader.u8(),
+        "ddsg_pin_config": reader.u8(),
+        "dfetoff_pin_config": reader.u8(),
+    }
+    return result
+
+
+def parse_current_calibration_result(data: bytes) -> Dict[str, object]:
+    if len(data) >= 24:
+        status, actual, measured, deviation, old_gain, new_gain = struct.unpack_from(
+            "<IiiIII", data, 0
+        )
+    elif len(data) >= 21:
+        status = data[0]
+        actual, measured, deviation, old_gain, new_gain = struct.unpack_from(
+            "<iiIII", data, 1
+        )
+    else:
+        raise ProtocolError(
+            f"calibration result payload too short: {len(data)} bytes"
+        )
+    return {
+        "status": status,
+        "status_name": CALIBRATION_STATUS_NAMES.get(status, f"0x{status:X}"),
+        "actual_mA": actual,
+        "measured_mA": measured,
+        "deviation_ppm": deviation,
+        "old_gain_ppm": old_gain,
+        "new_gain_ppm": new_gain,
+    }
+
+
+def parse_summary(data: bytes) -> Dict[str, object]:
+    """Parse either the compact summary payload or the raw BMS_Tracking_t payload.
+
+    Current reference firmware has the compact summary code commented out and sends
+    the raw struct. Because BMS_UART_MAX_PAYLOAD_SIZE is 64, that build can return
+    INTERNAL_ERROR for READ_SUMMARY. This parser still supports both formats for
+    firmware variants where READ_SUMMARY is enabled.
+    """
+
+    if len(data) >= 55 and data[0] == PROTOCOL_VERSION:
+        return parse_compact_summary(data)
+    if len(data) >= 160:
+        return parse_tracking_summary(data)
+    return {
+        "summary_format": "unknown",
+        "payload_length": len(data),
+        "raw_hex": data.hex(" "),
+    }
+
+
+def parse_compact_summary(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    version = reader.u8()
+    uptime_ms = reader.u32()
+    initialized = reader.bool()
+    connected = reader.bool()
+    state = reader.u8()
+    current_direction = reader.u8()
+    fault_bitmap = reader.u16()
+    stack_voltage = reader.u16()
+    pack_voltage = reader.u16()
+    bat_adc_pack = reader.u16()
+    current = reader.i32()
+    min_cell = reader.u16()
+    max_cell = reader.u16()
+    avg_cell = reader.u16()
+    delta_cell = reader.u16()
+    temps = [reader.i16(), reader.i16()]
+    charge_throughput = reader.u32()
+    discharge_throughput = reader.u32()
+    equivalent_cycles = reader.u32()
+    fet_bitmap = reader.u8()
+    balance_required = reader.bool()
+    balance_mask = reader.u16()
+    alert_counter = reader.u32()
+    circle_counter = reader.u16()
+
+    return {
+        "summary_format": "compact",
+        "protocol_version": version,
+        "uptime_ms": uptime_ms,
+        "initialized": initialized,
+        "connected": connected,
+        "state": state,
+        "state_name": STATE_NAMES.get(state, f"UNKNOWN({state})"),
+        "current_direction": current_direction,
+        "current_direction_name": CURRENT_DIRECTION_NAMES.get(
+            current_direction, f"UNKNOWN({current_direction})"
+        ),
+        "fault_bitmap": fault_bitmap,
+        "faults": active_flag_names(fault_bitmap, FAULT_NAMES),
+        "stack_voltage_mV": stack_voltage,
+        "pack_voltage_mV": pack_voltage,
+        "bat_adc_estimated_pack_mV": bat_adc_pack,
+        "current_mA": current,
+        "min_cell_voltage_mV": min_cell,
+        "max_cell_voltage_mV": max_cell,
+        "average_cell_voltage_mV": avg_cell,
+        "delta_cell_voltage_mV": delta_cell,
+        "temperature_C": temps,
+        "charge_throughput_mAh": charge_throughput,
+        "discharge_throughput_mAh": discharge_throughput,
+        "equivalent_cycle_milliCycles": equivalent_cycles,
+        "fet_bitmap": fet_bitmap,
+        "fets": active_flag_names(fet_bitmap, FET_NAMES),
+        "balance_required": balance_required,
+        "balance_mask": balance_mask,
+        "alert_counter": alert_counter,
+        "circle_counter": circle_counter,
+    }
+
+
+def parse_tracking_summary(data: bytes) -> Dict[str, object]:
+    """Parse BMS_Tracking_t as emitted by the current C code.
+
+    Layout matches normal ARM GCC alignment with 4-byte enums and 8-byte
+    uint64_t alignment. If the firmware is built with different ABI options,
+    the GUI will keep showing the raw payload instead of pretending it knows.
+    """
+
+    if len(data) < 160:
+        raise ProtocolError("raw tracking payload needs at least 160 bytes")
+
+    cell_index_accumulated = list(data[12:22])
+    real_time_accumulated = [_u16(data, 22 + i * 2) for i in range(10)]
+    cell_voltages = [_u16(data, 42 + i * 2) for i in range(10)]
+    fault_values = [_bool(data, 94 + i) for i in range(len(FAULT_NAMES))]
+    fault_bitmap = _fault_bitmap_from_bools(fault_values)
+
+    summary: Dict[str, object] = {
+        "summary_format": "raw_tracking",
+        "initialized": _bool(data, 0),
+        "connected": _bool(data, 1),
+        "state": _u32(data, 4),
+        "current_direction": _u32(data, 8),
+        "cell_index_accumulated": cell_index_accumulated,
+        "cell_real_time_accumulated": real_time_accumulated,
+        "cell_voltages_mV": cell_voltages,
+        "min_cell_voltage_mV": _u16(data, 62),
+        "max_cell_voltage_mV": _u16(data, 64),
+        "average_cell_voltage_mV": _u16(data, 66),
+        "delta_cell_voltage_mV": _u16(data, 68),
+        "stack_voltage_mV": _u16(data, 70),
+        "pack_voltage_mV": _u16(data, 72),
+        "circle_counter": _u16(data, 74),
+        "current_mA": _i32(data, 76),
+        "temperature_C": [_i16(data, 80), _i16(data, 82)],
+        "charging": _bool(data, 84),
+        "discharging": _bool(data, 85),
+        "charge_fet_enabled": _bool(data, 86),
+        "discharge_fet_enabled": _bool(data, 87),
+        "fets_enabled": _bool(data, 88),
+        "bq_charge_fet_blocked": _bool(data, 89),
+        "bq_discharge_fet_blocked": _bool(data, 90),
+        "bq_alarm_raw_status": _u16(data, 92),
+        "fault_bitmap": fault_bitmap,
+        "faults": active_flag_names(fault_bitmap, FAULT_NAMES),
+        "charge_disabled": _bool(data, 104),
+        "discharge_disabled": _bool(data, 105),
+        "charge_gate_fault_signal": _bool(data, 106),
+        "discharge_gate_fault_signal": _bool(data, 107),
+        "fetoff_asserted": _bool(data, 108),
+        "alert_active": _bool(data, 109),
+        "alert_counter": _u32(data, 112),
+        "bq_sleep_mode": _bool(data, 116),
+        "bq_sleep_allowed": _bool(data, 117),
+        "bat_sense_enabled": _bool(data, 118),
+        "bat_adc_estimated_pack_mV": _u16(data, 120),
+        "balance_required": _bool(data, 122),
+        "balance_mask": _u16(data, 124),
+        "charge_accumulated_mAs": _u64(data, 128),
+        "discharge_accumulated_mAs": _u64(data, 136),
+        "charge_throughput_mAh": _u32(data, 144),
+        "discharge_throughput_mAh": _u32(data, 148),
+        "equivalent_cycle_milliCycles": _u32(data, 152),
+        "current_calibration_gain_ppm": _u32(data, 156),
+    }
+    state = int(summary["state"])
+    direction = int(summary["current_direction"])
+    summary["state_name"] = STATE_NAMES.get(state, f"UNKNOWN({state})")
+    summary["current_direction_name"] = CURRENT_DIRECTION_NAMES.get(
+        direction, f"UNKNOWN({direction})"
+    )
+    fet_bitmap = _fet_bitmap_from_summary(summary)
+    summary["fet_bitmap"] = fet_bitmap
+    summary["fets"] = active_flag_names(fet_bitmap, FET_NAMES)
+    return summary
+
+
+def to_hex(data: bytes) -> str:
+    return data.hex(" ").upper()
+
+
+def from_hex(text: str) -> bytes:
+    compact = "".join(text.replace(",", " ").split())
+    if not compact:
+        return b""
+    if len(compact) % 2:
+        raise ValueError("hex payload must contain an even number of digits")
+    return bytes.fromhex(compact)
