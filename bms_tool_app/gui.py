@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -15,6 +16,10 @@ from .serial_client import (
     SerialDependencyError,
     list_serial_ports,
 )
+from .logging_config import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt_bool(value: object) -> str:
@@ -44,6 +49,7 @@ def _fmt_hex(value: object, width: int = 4) -> str:
 class BmsToolApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self.log_file = configure_logging()
         self.title("BMS UART Tool")
         self.geometry("1120x760")
         self.minsize(980, 660)
@@ -67,9 +73,11 @@ class BmsToolApp(tk.Tk):
 
         self._build_style()
         self._build_ui()
+        self._log(f"Log file: {self.log_file}")
         self.refresh_ports()
         self.after(100, self._drain_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        logger.info("GUI initialized")
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -392,6 +400,9 @@ class BmsToolApp(tk.Tk):
             self.port_var.set(ports[0])
         if not ports:
             self._log("No serial ports found.")
+        else:
+            self._log("Serial ports: " + ", ".join(ports))
+        logger.info("Serial ports refreshed: %s", ", ".join(ports) if ports else "none")
 
     def toggle_connection(self) -> None:
         if self.client.is_open:
@@ -405,16 +416,19 @@ class BmsToolApp(tk.Tk):
         port = self.port_var.get().strip()
         if not port:
             messagebox.showwarning("BMS UART Tool", "Select a serial port first.")
+            self._log("Connect skipped: no serial port selected.", logging.WARNING)
             return
         try:
             baud = int(self.baud_var.get())
+            self._log(f"Connecting to {port} at {baud} baud...")
             self.client.open(port, baud)
         except SerialDependencyError as exc:
             messagebox.showerror("Missing dependency", str(exc))
+            self._log(f"Missing dependency: {exc}", logging.ERROR)
             return
         except Exception as exc:
             messagebox.showerror("Connect failed", str(exc))
-            self._log(f"Connect failed: {exc}")
+            self._log(f"Connect failed: {exc}", logging.ERROR)
             return
 
         self.connect_button.configure(text="Disconnect")
@@ -477,18 +491,21 @@ class BmsToolApp(tk.Tk):
     def _run_worker(self, kind: str, func: Callable[[], object]) -> None:
         if not self.client.is_open:
             messagebox.showwarning("Not connected", "Connect to the BMS UART port first.")
+            self._log(f"{kind} skipped: serial port is not open.", logging.WARNING)
             return
         if self.worker_busy:
-            self._log("Serial request already in progress.")
+            self._log("Serial request already in progress.", logging.WARNING)
             return
         self.worker_busy = True
         self.status_var.set("Working...")
+        self._log(f"Starting {kind} request.")
 
         def target() -> None:
             try:
                 result = func()
                 self.events.put((kind, result))
             except Exception as exc:
+                logger.exception("%s request failed", kind)
                 self.events.put(("error", f"{kind}: {exc}"))
             finally:
                 self.events.put(("worker_done", None))
@@ -508,7 +525,7 @@ class BmsToolApp(tk.Tk):
                     else:
                         self.status_var.set("Disconnected")
                 elif kind == "error":
-                    self._log(f"ERROR: {payload}")
+                    self._log(f"ERROR: {payload}", logging.ERROR)
                     self.status_var.set(str(payload))
                 elif kind == "ping":
                     self._log(f"Ping response: {protocol.to_hex(bytes(payload))}")
@@ -533,7 +550,10 @@ class BmsToolApp(tk.Tk):
     def _update_read_all(self, data: Dict[str, object]) -> None:
         errors = data.get("errors", {})
         if isinstance(errors, dict) and errors:
-            self._log("Read warnings: " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+            self._log(
+                "Read warnings: " + "; ".join(f"{k}: {v}" for k, v in errors.items()),
+                logging.WARNING,
+            )
 
         summary = data.get("summary")
         cells = data.get("cells")
@@ -554,7 +574,31 @@ class BmsToolApp(tk.Tk):
         if isinstance(limits, dict):
             self._update_limits(limits)
 
-        self._log("Read complete.")
+        details: list[str] = []
+        if isinstance(summary, dict) and summary:
+            details.append(
+                "state={state} pack={pack} current={current}".format(
+                    state=summary.get("state_name", "-"),
+                    pack=_fmt_mv(summary.get("pack_voltage_mV")),
+                    current=_fmt_ma(summary.get("current_mA")),
+                )
+            )
+        if isinstance(cells, dict):
+            details.append(
+                "cells={count} min={minv} max={maxv} delta={delta}".format(
+                    count=cells.get("cell_count", "-"),
+                    minv=_fmt_mv(cells.get("min_cell_voltage_mV")),
+                    maxv=_fmt_mv(cells.get("max_cell_voltage_mV")),
+                    delta=_fmt_mv(cells.get("delta_cell_voltage_mV")),
+                )
+            )
+        if isinstance(faults, dict):
+            active_faults = faults.get("faults", [])
+            active_count = len(active_faults) if isinstance(active_faults, list) else 0
+            details.append(
+                f"faults={active_count} bitmap={_fmt_hex(faults.get('fault_bitmap'))}"
+            )
+        self._log("Read complete: " + " | ".join(details) if details else "Read complete.")
 
     def _update_summary(self, summary: Dict[str, object]) -> None:
         self.last_summary = summary
@@ -663,13 +707,27 @@ class BmsToolApp(tk.Tk):
                 var.set("-")
             else:
                 var.set(str(value))
+        logger.info(
+            "OTP updated: flags=%s check_result=%s write_result=%s",
+            _fmt_hex(otp.get("flags")),
+            otp.get("check_result", "-"),
+            otp.get("write_result", "-"),
+        )
 
     def _update_calibration(self, result: Dict[str, object]) -> None:
         for key, var in self._calibration_vars.items():
             value = result.get(key)
             var.set("-" if value is None else str(value))
+        logger.info(
+            "Calibration updated: status=%s actual=%s measured=%s new_gain=%s",
+            result.get("status_name", "-"),
+            result.get("actual_mA", "-"),
+            result.get("measured_mA", "-"),
+            result.get("new_gain_ppm", "-"),
+        )
 
-    def _log(self, message: str) -> None:
+    def _log(self, message: str, level: int = logging.INFO) -> None:
+        logger.log(level, message)
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"[{timestamp}] {message}\n")
@@ -677,12 +735,14 @@ class BmsToolApp(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def _on_close(self) -> None:
+        self._log("Closing BMS UART Tool.")
         self.auto_poll.set(False)
         self.client.close()
         self.destroy()
 
 
 def main() -> None:
+    configure_logging()
     app = BmsToolApp()
     app.mainloop()
 

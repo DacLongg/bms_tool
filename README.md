@@ -12,6 +12,9 @@ python run_bms_tool.py
 Default baud rate is `115200`; change it in the UI if the firmware UART uses a
 different speed.
 
+Launcher and runtime logs are written to `logs\bms_tool_YYYYMMDD_HHMMSS.log`.
+Set `BMS_TOOL_LOG_LEVEL=DEBUG` before running to include raw UART TX/RX frames.
+
 ## Features
 
 - Connect to a COM port with pyserial.

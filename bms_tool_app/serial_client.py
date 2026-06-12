@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Dict, List, Optional
 
 from . import protocol
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import serial
@@ -33,8 +37,11 @@ def require_pyserial() -> None:
 
 def list_serial_ports() -> List[str]:
     if list_ports is None:
+        logger.warning("Cannot list serial ports because pyserial is not installed")
         return []
-    return [port.device for port in list_ports.comports()]
+    ports = [port.device for port in list_ports.comports()]
+    logger.info("Detected serial ports: %s", ", ".join(ports) if ports else "none")
+    return ports
 
 
 class BmsSerialClient:
@@ -66,20 +73,31 @@ class BmsSerialClient:
             self.close()
             if baudrate is not None:
                 self.baudrate = baudrate
+            logger.info(
+                "Opening serial port %s at %s baud, timeout=%.3fs, write_timeout=%.3fs",
+                port,
+                self.baudrate,
+                self.serial_timeout_s,
+                self.write_timeout_s,
+            )
             self._serial = serial.Serial(
                 port=port,
                 baudrate=self.baudrate,
                 timeout=self.serial_timeout_s,
                 write_timeout=self.write_timeout_s,
             )
+            logger.info("Serial port %s opened", port)
 
     def close(self) -> None:
         with self._lock:
             if self._serial is not None:
+                port = self._serial.port
+                logger.info("Closing serial port %s", port)
                 try:
                     self._serial.close()
                 finally:
                     self._serial = None
+                    logger.info("Serial port %s closed", port)
 
     def request(
         self,
@@ -91,9 +109,19 @@ class BmsSerialClient:
         expected_command = command | protocol.RESPONSE_FLAG
         parser = protocol.FrameParser(max_payload=255)
         deadline = time.monotonic() + timeout_s
+        started_at = time.monotonic()
+        command_name = protocol.COMMAND_NAMES.get(command, f"0x{command:02X}")
+        logger.info(
+            "Request %s started: payload_len=%d timeout=%.2fs",
+            command_name,
+            len(payload),
+            timeout_s,
+        )
+        logger.debug("TX %s: %s", command_name, protocol.to_hex(frame))
 
         with self._lock:
             if not self.is_open:
+                logger.error("Request %s failed: serial port is not open", command_name)
                 raise RuntimeError("serial port is not open")
             ser = self._serial
             assert ser is not None
@@ -107,12 +135,46 @@ class BmsSerialClient:
                 chunk = ser.read(waiting or 1)
                 if not chunk:
                     continue
+                logger.debug("RX chunk for %s: %s", command_name, protocol.to_hex(chunk))
                 for response in parser.feed(chunk):
+                    logger.debug(
+                        "RX frame for %s: command=0x%02X payload_len=%d payload=%s",
+                        command_name,
+                        response.command,
+                        len(response.payload),
+                        protocol.to_hex(response.payload),
+                    )
                     if response.command != expected_command:
+                        logger.warning(
+                            "Ignoring response command 0x%02X while waiting for 0x%02X",
+                            response.command,
+                            expected_command,
+                        )
                         continue
-                    return protocol.decode_response(command, response)
+                    try:
+                        data = protocol.decode_response(command, response)
+                    except protocol.BmsStatusError as exc:
+                        logger.warning(
+                            "Request %s returned status %s with data_len=%d",
+                            command_name,
+                            protocol.STATUS_NAMES.get(exc.status, f"0x{exc.status:02X}"),
+                            len(exc.data),
+                        )
+                        raise
+                    except Exception:
+                        logger.exception("Request %s response decode failed", command_name)
+                        raise
+                    elapsed_ms = (time.monotonic() - started_at) * 1000
+                    logger.info(
+                        "Request %s completed in %.0f ms: response_len=%d",
+                        command_name,
+                        elapsed_ms,
+                        len(data),
+                    )
+                    return data
 
-        command_name = protocol.COMMAND_NAMES.get(command, f"0x{command:02X}")
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        logger.warning("Request %s timed out after %.0f ms", command_name, elapsed_ms)
         raise BmsTimeoutError(f"timeout waiting for {command_name} response")
 
     def ping(self, payload: bytes = b"BMS") -> bytes:
@@ -162,6 +224,8 @@ class BmsSerialClient:
         ):
             try:
                 result[key] = reader()
+                logger.info("read_all %s succeeded", key)
             except Exception as exc:  # Keep the UI useful if one command fails.
                 result["errors"][key] = str(exc)
+                logger.warning("read_all %s failed: %s", key, exc)
         return result
