@@ -10,7 +10,7 @@
 #define BMS_UART_SOF0                         0xAAU
 #define BMS_UART_SOF1                         0x55U
 #define BMS_UART_PROTOCOL_VERSION             0x04U
-#define BMS_UART_MAX_PAYLOAD_SIZE             96U
+#define BMS_UART_MAX_PAYLOAD_SIZE             160U
 
 /*
  * Frame:

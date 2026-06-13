@@ -21,6 +21,8 @@ RESPONSE_FLAG = 0x80
 PROTOCOL_VERSION = 0x04
 MAX_PAYLOAD_SIZE = 64
 OTP_WRITE_MAGIC = b"OTP!"
+RAW_TRACKING_SHORT_ENUM_SIZE = 152
+RAW_TRACKING_STANDARD_ENUM_SIZE = 160
 
 CMD_PING = 0x01
 CMD_READ_SUMMARY = 0x10
@@ -339,6 +341,10 @@ def _u64(data: bytes, offset: int) -> int:
     return struct.unpack_from("<Q", data, offset)[0]
 
 
+def _align(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) & ~(alignment - 1)
+
+
 def _fault_bitmap_from_bools(values: Iterable[bool]) -> int:
     bitmap = 0
     for bit, active in enumerate(values):
@@ -473,7 +479,7 @@ def parse_summary(data: bytes) -> Dict[str, object]:
 
     if len(data) >= 55 and data[0] == PROTOCOL_VERSION:
         return parse_compact_summary(data)
-    if len(data) >= 160:
+    if len(data) >= RAW_TRACKING_SHORT_ENUM_SIZE:
         return parse_tracking_summary(data)
     return {
         "summary_format": "unknown",
@@ -501,7 +507,7 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
     delta_cell = reader.u16()
     temps = [reader.i16(), reader.i16()]
     charge_throughput = reader.u32()
-    discharge_throughput = reader.u32()
+    # discharge_throughput = reader.u32()
     equivalent_cycles = reader.u32()
     fet_bitmap = reader.u8()
     balance_required = reader.bool()
@@ -533,7 +539,7 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
         "delta_cell_voltage_mV": delta_cell,
         "temperature_C": temps,
         "charge_throughput_mAh": charge_throughput,
-        "discharge_throughput_mAh": discharge_throughput,
+        # "discharge_throughput_mAh": discharge_throughput,
         "equivalent_cycle_milliCycles": equivalent_cycles,
         "fet_bitmap": fet_bitmap,
         "fets": active_flag_names(fet_bitmap, FET_NAMES),
@@ -547,67 +553,184 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
 def parse_tracking_summary(data: bytes) -> Dict[str, object]:
     """Parse BMS_Tracking_t as emitted by the current C code.
 
-    Layout matches normal ARM GCC alignment with 4-byte enums and 8-byte
-    uint64_t alignment. If the firmware is built with different ABI options,
-    the GUI will keep showing the raw payload instead of pretending it knows.
+    The firmware may be built with normal 4-byte enums, which makes the raw
+    struct 160 bytes, or with short 1-byte enums, which makes it 152 bytes.
     """
 
-    if len(data) < 160:
-        raise ProtocolError("raw tracking payload needs at least 160 bytes")
+    if len(data) >= RAW_TRACKING_STANDARD_ENUM_SIZE:
+        enum_size = 4
+        enum_reader = _u32
+        summary_format = "raw_tracking"
+    elif len(data) >= RAW_TRACKING_SHORT_ENUM_SIZE:
+        enum_size = 1
+        enum_reader = _u8
+        summary_format = "raw_tracking_short_enums"
+    else:
+        raise ProtocolError(
+            "raw tracking payload needs at least "
+            f"{RAW_TRACKING_SHORT_ENUM_SIZE} bytes; got {len(data)}"
+        )
 
-    cell_index_accumulated = list(data[12:22])
-    real_time_accumulated = [_u16(data, 22 + i * 2) for i in range(10)]
-    cell_voltages = [_u16(data, 42 + i * 2) for i in range(10)]
-    fault_values = [_bool(data, 94 + i) for i in range(len(FAULT_NAMES))]
+    offset = 0
+    initialized = _bool(data, offset)
+    offset += 1
+    connected = _bool(data, offset)
+    offset += 1
+
+    offset = _align(offset, enum_size)
+    state = enum_reader(data, offset)
+    offset += enum_size
+    current_direction = enum_reader(data, offset)
+    offset += enum_size
+
+    offset = _align(offset, 2)
+    cell_index_accumulated = list(data[offset : offset + 10])
+    offset += 10
+    offset = _align(offset, 2)
+    real_time_accumulated = [_u16(data, offset + i * 2) for i in range(10)]
+    offset += 20
+    cell_voltages = [_u16(data, offset + i * 2) for i in range(10)]
+    offset += 20
+    min_cell = _u16(data, offset)
+    offset += 2
+    max_cell = _u16(data, offset)
+    offset += 2
+    avg_cell = _u16(data, offset)
+    offset += 2
+    delta_cell = _u16(data, offset)
+    offset += 2
+
+    stack_voltage = _u16(data, offset)
+    offset += 2
+    pack_voltage = _u16(data, offset)
+    offset += 2
+    circle_counter = _u16(data, offset)
+    offset += 2
+
+    offset = _align(offset, 4)
+    current_ma = _i32(data, offset)
+    offset += 4
+    temperatures = [_i16(data, offset), _i16(data, offset + 2)]
+    offset += 4
+
+    charging = _bool(data, offset)
+    offset += 1
+    discharging = _bool(data, offset)
+    offset += 1
+    charge_fet_enabled = _bool(data, offset)
+    offset += 1
+    discharge_fet_enabled = _bool(data, offset)
+    offset += 1
+    fets_enabled = _bool(data, offset)
+    offset += 1
+    bq_charge_fet_blocked = _bool(data, offset)
+    offset += 1
+    bq_discharge_fet_blocked = _bool(data, offset)
+    offset += 1
+
+    offset = _align(offset, 2)
+    bq_alarm_raw_status = _u16(data, offset)
+    offset += 2
+
+    fault_values = [_bool(data, offset + i) for i in range(len(FAULT_NAMES))]
+    offset += len(FAULT_NAMES)
     fault_bitmap = _fault_bitmap_from_bools(fault_values)
 
+    charge_disabled = _bool(data, offset)
+    offset += 1
+    discharge_disabled = _bool(data, offset)
+    offset += 1
+    charge_gate_fault_signal = _bool(data, offset)
+    offset += 1
+    discharge_gate_fault_signal = _bool(data, offset)
+    offset += 1
+    fetoff_asserted = _bool(data, offset)
+    offset += 1
+    alert_active = _bool(data, offset)
+    offset += 1
+
+    offset = _align(offset, 4)
+    alert_counter = _u32(data, offset)
+    offset += 4
+    bq_sleep_mode = _bool(data, offset)
+    offset += 1
+    bq_sleep_allowed = _bool(data, offset)
+    offset += 1
+    bat_sense_enabled = _bool(data, offset)
+    offset += 1
+
+    offset = _align(offset, 2)
+    bat_adc_pack = _u16(data, offset)
+    offset += 2
+    balance_required = _bool(data, offset)
+    offset += 1
+    offset = _align(offset, 2)
+    balance_mask = _u16(data, offset)
+    offset += 2
+
+    offset = _align(offset, 8)
+    charge_accumulated = _u64(data, offset)
+    offset += 8
+    discharge_accumulated = _u64(data, offset)
+    offset += 8
+    charge_throughput = _u32(data, offset)
+    offset += 4
+    # discharge_throughput = _u32(data, offset)
+    # offset += 4
+    equivalent_cycles = _u32(data, offset)
+    offset += 4
+    current_calibration_gain = _u32(data, offset)
+    offset += 4
+
     summary: Dict[str, object] = {
-        "summary_format": "raw_tracking",
-        "initialized": _bool(data, 0),
-        "connected": _bool(data, 1),
-        "state": _u32(data, 4),
-        "current_direction": _u32(data, 8),
+        "summary_format": summary_format,
+        "payload_length": len(data),
+        "parsed_length": offset,
+        "initialized": initialized,
+        "connected": connected,
+        "state": state,
+        "current_direction": current_direction,
         "cell_index_accumulated": cell_index_accumulated,
         "cell_real_time_accumulated": real_time_accumulated,
         "cell_voltages_mV": cell_voltages,
-        "min_cell_voltage_mV": _u16(data, 62),
-        "max_cell_voltage_mV": _u16(data, 64),
-        "average_cell_voltage_mV": _u16(data, 66),
-        "delta_cell_voltage_mV": _u16(data, 68),
-        "stack_voltage_mV": _u16(data, 70),
-        "pack_voltage_mV": _u16(data, 72),
-        "circle_counter": _u16(data, 74),
-        "current_mA": _i32(data, 76),
-        "temperature_C": [_i16(data, 80), _i16(data, 82)],
-        "charging": _bool(data, 84),
-        "discharging": _bool(data, 85),
-        "charge_fet_enabled": _bool(data, 86),
-        "discharge_fet_enabled": _bool(data, 87),
-        "fets_enabled": _bool(data, 88),
-        "bq_charge_fet_blocked": _bool(data, 89),
-        "bq_discharge_fet_blocked": _bool(data, 90),
-        "bq_alarm_raw_status": _u16(data, 92),
+        "min_cell_voltage_mV": min_cell,
+        "max_cell_voltage_mV": max_cell,
+        "average_cell_voltage_mV": avg_cell,
+        "delta_cell_voltage_mV": delta_cell,
+        "stack_voltage_mV": stack_voltage,
+        "pack_voltage_mV": pack_voltage,
+        "circle_counter": circle_counter,
+        "current_mA": current_ma,
+        "temperature_C": temperatures,
+        "charging": charging,
+        "discharging": discharging,
+        "charge_fet_enabled": charge_fet_enabled,
+        "discharge_fet_enabled": discharge_fet_enabled,
+        "fets_enabled": fets_enabled,
+        "bq_charge_fet_blocked": bq_charge_fet_blocked,
+        "bq_discharge_fet_blocked": bq_discharge_fet_blocked,
+        "bq_alarm_raw_status": bq_alarm_raw_status,
         "fault_bitmap": fault_bitmap,
         "faults": active_flag_names(fault_bitmap, FAULT_NAMES),
-        "charge_disabled": _bool(data, 104),
-        "discharge_disabled": _bool(data, 105),
-        "charge_gate_fault_signal": _bool(data, 106),
-        "discharge_gate_fault_signal": _bool(data, 107),
-        "fetoff_asserted": _bool(data, 108),
-        "alert_active": _bool(data, 109),
-        "alert_counter": _u32(data, 112),
-        "bq_sleep_mode": _bool(data, 116),
-        "bq_sleep_allowed": _bool(data, 117),
-        "bat_sense_enabled": _bool(data, 118),
-        "bat_adc_estimated_pack_mV": _u16(data, 120),
-        "balance_required": _bool(data, 122),
-        "balance_mask": _u16(data, 124),
-        "charge_accumulated_mAs": _u64(data, 128),
-        "discharge_accumulated_mAs": _u64(data, 136),
-        "charge_throughput_mAh": _u32(data, 144),
-        "discharge_throughput_mAh": _u32(data, 148),
-        "equivalent_cycle_milliCycles": _u32(data, 152),
-        "current_calibration_gain_ppm": _u32(data, 156),
+        "charge_disabled": charge_disabled,
+        "discharge_disabled": discharge_disabled,
+        "charge_gate_fault_signal": charge_gate_fault_signal,
+        "discharge_gate_fault_signal": discharge_gate_fault_signal,
+        "fetoff_asserted": fetoff_asserted,
+        "alert_active": alert_active,
+        "alert_counter": alert_counter,
+        "bq_sleep_mode": bq_sleep_mode,
+        "bq_sleep_allowed": bq_sleep_allowed,
+        "bat_sense_enabled": bat_sense_enabled,
+        "bat_adc_estimated_pack_mV": bat_adc_pack,
+        "balance_required": balance_required,
+        "balance_mask": balance_mask,
+        "charge_accumulated_mAs": charge_accumulated,
+        "discharge_accumulated_mAs": discharge_accumulated,
+        "charge_throughput_mAh": charge_throughput,
+        # "discharge_throughput_mAh": discharge_throughput,
+        "equivalent_cycle_milliCycles": equivalent_cycles,
+        "current_calibration_gain_ppm": current_calibration_gain,
     }
     state = int(summary["state"])
     direction = int(summary["current_direction"])

@@ -45,6 +45,60 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(parsed["alert_active"])
         self.assertEqual(parsed["alert_counter"], 123)
 
+    def test_parse_raw_tracking_summary_with_short_enums(self):
+        data = bytearray(protocol.RAW_TRACKING_SHORT_ENUM_SIZE)
+        data[0] = 1
+        data[1] = 1
+        data[2] = 1
+        data[3] = 2
+
+        cell_base = 4
+        data[cell_base : cell_base + 10] = bytes(range(10))
+        struct.pack_into("<10H", data, cell_base + 10, *range(100, 110))
+        struct.pack_into("<10H", data, cell_base + 30, *range(3700, 3710))
+        struct.pack_into("<HHHH", data, cell_base + 50, 3700, 3709, 3704, 9)
+
+        struct.pack_into("<HHH", data, 62, 37040, 37000, 77)
+        struct.pack_into("<i", data, 68, -1234)
+        struct.pack_into("<hh", data, 72, 25, 26)
+        data[76] = 1
+        data[78] = 1
+        data[79] = 1
+        data[80] = 1
+        data[82] = 1
+        struct.pack_into("<H", data, 84, 0x1234)
+        data[86] = 1
+        data[93] = 1
+        data[96] = 1
+        data[98] = 1
+        data[100] = 1
+        data[101] = 1
+        struct.pack_into("<I", data, 104, 42)
+        data[108] = 1
+        data[110] = 1
+        struct.pack_into("<H", data, 112, 37100)
+        data[114] = 1
+        struct.pack_into("<H", data, 116, 0x0155)
+        struct.pack_into("<Q", data, 120, 1000)
+        struct.pack_into("<Q", data, 128, 2000)
+        struct.pack_into("<IIII", data, 136, 10, 20, 30, 999999)
+
+        parsed = protocol.parse_summary(bytes(data))
+        self.assertEqual(parsed["summary_format"], "raw_tracking_short_enums")
+        self.assertEqual(parsed["payload_length"], 152)
+        self.assertEqual(parsed["parsed_length"], 152)
+        self.assertEqual(parsed["state_name"], "NORMAL")
+        self.assertEqual(parsed["current_direction_name"], "DISCHARGE")
+        self.assertEqual(parsed["cell_voltages_mV"], list(range(3700, 3710)))
+        self.assertEqual(parsed["stack_voltage_mV"], 37040)
+        self.assertEqual(parsed["pack_voltage_mV"], 37000)
+        self.assertEqual(parsed["current_mA"], -1234)
+        self.assertEqual(parsed["temperature_C"], [25, 26])
+        self.assertIn("Cell over voltage", parsed["faults"])
+        self.assertIn("Short circuit", parsed["faults"])
+        self.assertEqual(parsed["balance_mask"], 0x0155)
+        self.assertEqual(parsed["current_calibration_gain_ppm"], 999999)
+
     def test_hex_helpers(self):
         self.assertEqual(protocol.from_hex("01 02,0A"), b"\x01\x02\x0A")
         self.assertEqual(protocol.to_hex(b"\x01\x02\x0A"), "01 02 0A")

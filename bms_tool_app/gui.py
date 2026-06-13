@@ -20,6 +20,7 @@ from .logging_config import configure_logging
 
 
 logger = logging.getLogger(__name__)
+SUMMARY_POLL_INTERVAL_MS = 5000
 
 
 def _fmt_bool(value: object) -> str:
@@ -57,6 +58,7 @@ class BmsToolApp(tk.Tk):
         self.client = BmsSerialClient()
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.worker_busy = False
+        self.summary_poll_after_id: Optional[str] = None
         self.auto_poll = tk.BooleanVar(value=False)
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
@@ -76,6 +78,7 @@ class BmsToolApp(tk.Tk):
         self._log(f"Log file: {self.log_file}")
         self.refresh_ports()
         self.after(100, self._drain_events)
+        self._schedule_summary_poll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         logger.info("GUI initialized")
 
@@ -132,7 +135,7 @@ class BmsToolApp(tk.Tk):
         self.baud_combo = ttk.Combobox(
             bar,
             textvariable=self.baud_var,
-            values=("9600", "19200", "38400", "57600", "115200", "230400"),
+            values=("2400", "9600", "19200", "38400", "57600", "115200", "230400"),
             width=10,
         )
         self.baud_combo.grid(row=0, column=4, padx=(6, 10))
@@ -434,12 +437,16 @@ class BmsToolApp(tk.Tk):
         self.connect_button.configure(text="Disconnect")
         self.status_var.set(f"Connected to {port} at {self.client.baudrate} baud")
         self._log(f"Connected to {port} at {self.client.baudrate} baud.")
+        self._reschedule_summary_poll(0)
 
     def ping(self) -> None:
         self._run_worker("ping", lambda: self.client.ping(b"BMS"))
 
     def read_once(self) -> None:
         self._run_worker("read_all", self.client.read_all)
+
+    def read_summary(self) -> None:
+        self._run_worker("summary", self.client.read_summary)
 
     def otp_check(self) -> None:
         self._run_worker("otp", self.client.otp_check)
@@ -488,6 +495,27 @@ class BmsToolApp(tk.Tk):
             self.read_once()
         self._schedule_auto_poll()
 
+    def _schedule_summary_poll(self, delay_ms: int = SUMMARY_POLL_INTERVAL_MS) -> None:
+        if self.summary_poll_after_id is None:
+            self.summary_poll_after_id = self.after(delay_ms, self._summary_poll_tick)
+
+    def _reschedule_summary_poll(self, delay_ms: int = SUMMARY_POLL_INTERVAL_MS) -> None:
+        if self.summary_poll_after_id is not None:
+            try:
+                self.after_cancel(self.summary_poll_after_id)
+            except tk.TclError:
+                pass
+            self.summary_poll_after_id = None
+        self._schedule_summary_poll(delay_ms)
+
+    def _summary_poll_tick(self) -> None:
+        self.summary_poll_after_id = None
+        if self.client.is_open and not self.worker_busy:
+            self.read_summary()
+        elif self.client.is_open:
+            logger.info("Summary poll skipped because serial worker is busy")
+        self._schedule_summary_poll()
+
     def _run_worker(self, kind: str, func: Callable[[], object]) -> None:
         if not self.client.is_open:
             messagebox.showwarning("Not connected", "Connect to the BMS UART port first.")
@@ -529,6 +557,10 @@ class BmsToolApp(tk.Tk):
                     self.status_var.set(str(payload))
                 elif kind == "ping":
                     self._log(f"Ping response: {protocol.to_hex(bytes(payload))}")
+                elif kind == "summary":
+                    self._update_summary(payload)
+                    self.summary_note_var.set("")
+                    self._log_summary(payload)
                 elif kind == "read_all":
                     self._update_read_all(payload)
                 elif kind == "otp":
@@ -546,6 +578,18 @@ class BmsToolApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
+
+    def _log_summary(self, summary: object) -> None:
+        if not isinstance(summary, dict) or not summary:
+            self._log("Summary updated.")
+            return
+        self._log(
+            "Summary updated: state={state} pack={pack} current={current}".format(
+                state=summary.get("state_name", "-"),
+                pack=_fmt_mv(summary.get("pack_voltage_mV")),
+                current=_fmt_ma(summary.get("current_mA")),
+            )
+        )
 
     def _update_read_all(self, data: Dict[str, object]) -> None:
         errors = data.get("errors", {})
@@ -736,6 +780,12 @@ class BmsToolApp(tk.Tk):
 
     def _on_close(self) -> None:
         self._log("Closing BMS UART Tool.")
+        if self.summary_poll_after_id is not None:
+            try:
+                self.after_cancel(self.summary_poll_after_id)
+            except tk.TclError:
+                pass
+            self.summary_poll_after_id = None
         self.auto_poll.set(False)
         self.client.close()
         self.destroy()
