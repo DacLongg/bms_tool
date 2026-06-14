@@ -30,8 +30,21 @@ typedef enum {
     BMS_UART_CMD_OTP_CHECK = 0x20U,
     BMS_UART_CMD_OTP_WRITE = 0x21U,
     BMS_UART_CMD_OTP_READ = 0x22U,
-    BMS_UART_CMD_CALIBRATE_CURRENT = 0x30U
+    BMS_UART_CMD_CALIBRATE_CURRENT = 0x30U,
+    BMS_UART_CMD_PROTECTION_EVENT = 0x40U
 } bms_uart_command_t;
+
+typedef enum {
+    BMS_UART_PROTECT_CELL_OV = 0x01U,
+    BMS_UART_PROTECT_CELL_UV = 0x02U,
+    BMS_UART_PROTECT_CHARGE_OT = 0x03U,
+    BMS_UART_PROTECT_DISCHARGE_OT = 0x04U,
+    BMS_UART_PROTECT_UNDERTEMP = 0x05U,
+    BMS_UART_PROTECT_CHARGE_OC = 0x06U,
+    BMS_UART_PROTECT_DISCHARGE_OC = 0x07U,
+    BMS_UART_PROTECT_SHORT_CIRCUIT = 0x08U,
+    BMS_UART_PROTECT_COMMUNICATION = 0x09U
+} bms_uart_protection_reason_t;
 
 typedef enum {
     BMS_UART_STATUS_OK = 0x00U,
@@ -44,6 +57,8 @@ typedef enum {
 
 void bms_uart_init(UART_HandleTypeDef *uart);
 void bms_uart_task(void);
+void bms_uart_restart_rx(void);
+void bms_uart_send_protection_reason(uint8_t reason);
 bool bms_uart_is_enabled(void);
 
 #endif

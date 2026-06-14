@@ -19,10 +19,12 @@ SOF0 = 0xAA
 SOF1 = 0x55
 RESPONSE_FLAG = 0x80
 PROTOCOL_VERSION = 0x04
-MAX_PAYLOAD_SIZE = 64
+MAX_PAYLOAD_SIZE = 160
 OTP_WRITE_MAGIC = b"OTP!"
 RAW_TRACKING_SHORT_ENUM_SIZE = 152
 RAW_TRACKING_STANDARD_ENUM_SIZE = 160
+COMPACT_SUMMARY_SIZE = 51
+COMPACT_SUMMARY_WITH_DISCHARGE_SIZE = 55
 
 CMD_PING = 0x01
 CMD_READ_SUMMARY = 0x10
@@ -33,6 +35,7 @@ CMD_OTP_CHECK = 0x20
 CMD_OTP_WRITE = 0x21
 CMD_OTP_READ = 0x22
 CMD_CALIBRATE_CURRENT = 0x30
+CMD_PROTECTION_EVENT = 0x40
 
 COMMAND_NAMES = {
     CMD_PING: "PING",
@@ -44,6 +47,7 @@ COMMAND_NAMES = {
     CMD_OTP_WRITE: "OTP_WRITE",
     CMD_OTP_READ: "OTP_READ",
     CMD_CALIBRATE_CURRENT: "CALIBRATE_CURRENT",
+    CMD_PROTECTION_EVENT: "PROTECTION_EVENT",
 }
 
 STATUS_OK = 0x00
@@ -88,6 +92,30 @@ FAULT_NAMES = [
     "BQ safety fault",
     "Communication fault",
 ]
+
+PROTECTION_REASON_NAMES = {
+    0x01: "Cell over voltage",
+    0x02: "Cell under voltage",
+    0x03: "Charge over temperature",
+    0x04: "Discharge over temperature",
+    0x05: "Under temperature",
+    0x06: "Charge over current",
+    0x07: "Discharge over current",
+    0x08: "Short circuit",
+    0x09: "Communication fault",
+}
+
+PROTECTION_REASON_FAULT_NAMES = {
+    0x01: "Cell over voltage",
+    0x02: "Cell under voltage",
+    0x03: "Charge over temperature",
+    0x04: "Discharge over temperature",
+    0x05: "Under temperature",
+    0x06: "Charge over current",
+    0x07: "Discharge over current",
+    0x08: "Short circuit",
+    0x09: "Communication fault",
+}
 
 GATE_SIGNAL_NAMES = [
     "DCHG pin active",
@@ -396,6 +424,17 @@ def parse_faults(data: bytes) -> Dict[str, object]:
     }
 
 
+def parse_protection_event(data: bytes) -> Dict[str, object]:
+    reader = PayloadReader(data)
+    reason = reader.u8()
+    return {
+        "reason": reason,
+        "reason_name": PROTECTION_REASON_NAMES.get(reason, f"UNKNOWN(0x{reason:02X})"),
+        "fault_name": PROTECTION_REASON_FAULT_NAMES.get(reason),
+        "raw_hex": to_hex(data),
+    }
+
+
 def parse_limits(data: bytes) -> Dict[str, object]:
     reader = PayloadReader(data)
     return {
@@ -443,41 +482,64 @@ def parse_otp_status(data: bytes) -> Dict[str, object]:
     return result
 
 
-def parse_current_calibration_result(data: bytes) -> Dict[str, object]:
-    if len(data) >= 24:
+def parse_current_calibration_result(
+    data: bytes,
+    status: Optional[int] = None,
+    actual_ma: Optional[int] = None,
+) -> Dict[str, object]:
+    if status is None and len(data) >= 24:
         status, actual, measured, deviation, old_gain, new_gain = struct.unpack_from(
             "<IiiIII", data, 0
         )
-    elif len(data) >= 21:
+        return {
+            "status": status,
+            "status_name": CALIBRATION_STATUS_NAMES.get(status, f"0x{status:X}"),
+            "actual_mA": actual,
+            "measured_mA": measured,
+            "deviation_ppm": deviation,
+            "old_gain_ppm": old_gain,
+            "new_gain_ppm": new_gain,
+        }
+    if status is None and len(data) >= 21:
         status = data[0]
         actual, measured, deviation, old_gain, new_gain = struct.unpack_from(
             "<iiIII", data, 1
         )
-    else:
+        return {
+            "status": status,
+            "status_name": CALIBRATION_STATUS_NAMES.get(status, f"0x{status:X}"),
+            "actual_mA": actual,
+            "measured_mA": measured,
+            "deviation_ppm": deviation,
+            "old_gain_ppm": old_gain,
+            "new_gain_ppm": new_gain,
+        }
+    if len(data) < 12:
         raise ProtocolError(
-            f"calibration result payload too short: {len(data)} bytes"
+            f"calibration result payload too short: {len(data)} bytes; need 12"
         )
-    return {
+    measured, deviation, new_gain = struct.unpack_from("<iII", data, 0)
+    status = STATUS_OK if status is None else status
+    result = {
         "status": status,
         "status_name": CALIBRATION_STATUS_NAMES.get(status, f"0x{status:X}"),
-        "actual_mA": actual,
         "measured_mA": measured,
         "deviation_ppm": deviation,
-        "old_gain_ppm": old_gain,
         "new_gain_ppm": new_gain,
     }
+    if actual_ma is not None:
+        result["actual_mA"] = actual_ma
+    return result
 
 
 def parse_summary(data: bytes) -> Dict[str, object]:
     """Parse either the compact summary payload or the raw BMS_Tracking_t payload.
 
-    Current reference firmware has the compact summary code commented out and sends
-    the raw struct. Because BMS_UART_MAX_PAYLOAD_SIZE is 64, that build can return
-    INTERNAL_ERROR for READ_SUMMARY. This parser still supports both formats for
-    firmware variants where READ_SUMMARY is enabled.
+    Current reference firmware sends the raw struct. This parser still supports
+    compact summary payloads for firmware variants where that path is enabled.
     """
 
-    if len(data) >= 55 and data[0] == PROTOCOL_VERSION:
+    if len(data) >= COMPACT_SUMMARY_SIZE and data[0] == PROTOCOL_VERSION:
         return parse_compact_summary(data)
     if len(data) >= RAW_TRACKING_SHORT_ENUM_SIZE:
         return parse_tracking_summary(data)
@@ -507,7 +569,9 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
     delta_cell = reader.u16()
     temps = [reader.i16(), reader.i16()]
     charge_throughput = reader.u32()
-    # discharge_throughput = reader.u32()
+    discharge_throughput = None
+    if len(data) >= COMPACT_SUMMARY_WITH_DISCHARGE_SIZE:
+        discharge_throughput = reader.u32()
     equivalent_cycles = reader.u32()
     fet_bitmap = reader.u8()
     balance_required = reader.bool()
@@ -515,7 +579,7 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
     alert_counter = reader.u32()
     circle_counter = reader.u16()
 
-    return {
+    result = {
         "summary_format": "compact",
         "protocol_version": version,
         "uptime_ms": uptime_ms,
@@ -539,7 +603,6 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
         "delta_cell_voltage_mV": delta_cell,
         "temperature_C": temps,
         "charge_throughput_mAh": charge_throughput,
-        # "discharge_throughput_mAh": discharge_throughput,
         "equivalent_cycle_milliCycles": equivalent_cycles,
         "fet_bitmap": fet_bitmap,
         "fets": active_flag_names(fet_bitmap, FET_NAMES),
@@ -548,6 +611,9 @@ def parse_compact_summary(data: bytes) -> Dict[str, object]:
         "alert_counter": alert_counter,
         "circle_counter": circle_counter,
     }
+    if discharge_throughput is not None:
+        result["discharge_throughput_mAh"] = discharge_throughput
+    return result
 
 
 def parse_tracking_summary(data: bytes) -> Dict[str, object]:
@@ -648,6 +714,9 @@ def parse_tracking_summary(data: bytes) -> Dict[str, object]:
     offset += 1
     alert_active = _bool(data, offset)
     offset += 1
+    gate_signal_bitmap = 0
+    gate_signal_bitmap |= 1 << 0 if charge_gate_fault_signal else 0
+    gate_signal_bitmap |= 1 << 1 if discharge_gate_fault_signal else 0
 
     offset = _align(offset, 4)
     alert_counter = _u32(data, offset)
@@ -675,8 +744,6 @@ def parse_tracking_summary(data: bytes) -> Dict[str, object]:
     offset += 8
     charge_throughput = _u32(data, offset)
     offset += 4
-    # discharge_throughput = _u32(data, offset)
-    # offset += 4
     equivalent_cycles = _u32(data, offset)
     offset += 4
     current_calibration_gain = _u32(data, offset)
@@ -716,6 +783,8 @@ def parse_tracking_summary(data: bytes) -> Dict[str, object]:
         "discharge_disabled": discharge_disabled,
         "charge_gate_fault_signal": charge_gate_fault_signal,
         "discharge_gate_fault_signal": discharge_gate_fault_signal,
+        "gate_signal_bitmap": gate_signal_bitmap,
+        "gate_signals": active_flag_names(gate_signal_bitmap, GATE_SIGNAL_NAMES),
         "fetoff_asserted": fetoff_asserted,
         "alert_active": alert_active,
         "alert_counter": alert_counter,
@@ -728,7 +797,6 @@ def parse_tracking_summary(data: bytes) -> Dict[str, object]:
         "charge_accumulated_mAs": charge_accumulated,
         "discharge_accumulated_mAs": discharge_accumulated,
         "charge_throughput_mAh": charge_throughput,
-        # "discharge_throughput_mAh": discharge_throughput,
         "equivalent_cycle_milliCycles": equivalent_cycles,
         "current_calibration_gain_ppm": current_calibration_gain,
     }

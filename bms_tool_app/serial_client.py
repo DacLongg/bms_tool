@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from . import protocol
 
@@ -50,11 +50,14 @@ class BmsSerialClient:
         baudrate: int = 115200,
         serial_timeout_s: float = 0.05,
         write_timeout_s: float = 0.5,
+        event_callback: Optional[Callable[[str, object], None]] = None,
     ) -> None:
         self.baudrate = baudrate
         self.serial_timeout_s = serial_timeout_s
         self.write_timeout_s = write_timeout_s
+        self.event_callback = event_callback
         self._serial = None
+        self._event_parser = protocol.FrameParser(max_payload=protocol.MAX_PAYLOAD_SIZE)
         self._lock = threading.RLock()
 
     @property
@@ -107,9 +110,10 @@ class BmsSerialClient:
     ) -> bytes:
         frame = protocol.build_frame(command, payload)
         expected_command = command | protocol.RESPONSE_FLAG
-        parser = protocol.FrameParser(max_payload=255)
+        parser = protocol.FrameParser(max_payload=protocol.MAX_PAYLOAD_SIZE)
         deadline = time.monotonic() + timeout_s
         started_at = time.monotonic()
+        response_data: Optional[bytes] = None
         command_name = protocol.COMMAND_NAMES.get(command, f"0x{command:02X}")
         logger.info(
             "Request %s started: payload_len=%d timeout=%.2fs",
@@ -126,11 +130,10 @@ class BmsSerialClient:
             ser = self._serial
             assert ser is not None
 
-            ser.reset_input_buffer()
             ser.write(frame)
             ser.flush()
 
-            while time.monotonic() < deadline:
+            while response_data is None and time.monotonic() < deadline:
                 waiting = getattr(ser, "in_waiting", 0)
                 chunk = ser.read(waiting or 1)
                 if not chunk:
@@ -144,6 +147,8 @@ class BmsSerialClient:
                         len(response.payload),
                         protocol.to_hex(response.payload),
                     )
+                    if self._handle_unsolicited_frame(response):
+                        continue
                     if response.command != expected_command:
                         logger.warning(
                             "Ignoring response command 0x%02X while waiting for 0x%02X",
@@ -171,11 +176,54 @@ class BmsSerialClient:
                         elapsed_ms,
                         len(data),
                     )
-                    return data
+                    response_data = data
+
+            if response_data is not None:
+                return response_data
 
         elapsed_ms = (time.monotonic() - started_at) * 1000
         logger.warning("Request %s timed out after %.0f ms", command_name, elapsed_ms)
         raise BmsTimeoutError(f"timeout waiting for {command_name} response")
+
+    def _handle_unsolicited_frame(self, frame: protocol.Frame) -> bool:
+        if frame.command != protocol.CMD_PROTECTION_EVENT:
+            return False
+        try:
+            event = protocol.parse_protection_event(frame.payload)
+        except Exception:
+            logger.exception("Failed to parse protection event: %s", protocol.to_hex(frame.payload))
+            return True
+        logger.warning(
+            "Protection event received: %s (0x%02X)",
+            event.get("reason_name", "-"),
+            int(event.get("reason", 0)),
+        )
+        if self.event_callback is not None:
+            self.event_callback("protection_event", event)
+        return True
+
+    def read_pending_events(self) -> int:
+        with self._lock:
+            if not self.is_open:
+                return 0
+            ser = self._serial
+            assert ser is not None
+            waiting = int(getattr(ser, "in_waiting", 0) or 0)
+            if waiting <= 0:
+                return 0
+            chunk = ser.read(waiting)
+
+        handled = 0
+        for frame in self._event_parser.feed(chunk):
+            if self._handle_unsolicited_frame(frame):
+                handled += 1
+            else:
+                logger.warning(
+                    "Ignoring unsolicited frame command 0x%02X payload=%s",
+                    frame.command,
+                    protocol.to_hex(frame.payload),
+                )
+        return handled
 
     def ping(self, payload: bytes = b"BMS") -> bytes:
         return self.request(protocol.CMD_PING, payload)
@@ -207,12 +255,23 @@ class BmsSerialClient:
         return protocol.parse_otp_status(data)
 
     def calibrate_current(self, actual_ma: int) -> Dict[str, object]:
-        data = self.request(
-            protocol.CMD_CALIBRATE_CURRENT,
-            protocol.make_calibration_payload(actual_ma),
-            timeout_s=3.0,
+        try:
+            data = self.request(
+                protocol.CMD_CALIBRATE_CURRENT,
+                protocol.make_calibration_payload(actual_ma),
+                timeout_s=3.0,
+            )
+            status = protocol.STATUS_OK
+        except protocol.BmsStatusError as exc:
+            if exc.command != protocol.CMD_CALIBRATE_CURRENT:
+                raise
+            data = exc.data
+            status = exc.status
+        return protocol.parse_current_calibration_result(
+            data,
+            status=status,
+            actual_ma=actual_ma,
         )
-        return protocol.parse_current_calibration_result(data)
 
     def read_all(self) -> Dict[str, object]:
         result: Dict[str, object] = {"errors": {}}

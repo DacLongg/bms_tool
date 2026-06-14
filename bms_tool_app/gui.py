@@ -21,6 +21,7 @@ from .logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 SUMMARY_POLL_INTERVAL_MS = 5000
+SERIAL_EVENT_POLL_INTERVAL_MS = 200
 
 
 def _fmt_bool(value: object) -> str:
@@ -55,16 +56,18 @@ class BmsToolApp(tk.Tk):
         self.geometry("1120x760")
         self.minsize(980, 660)
 
-        self.client = BmsSerialClient()
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.client = BmsSerialClient(event_callback=self._queue_serial_event)
         self.worker_busy = False
         self.summary_poll_after_id: Optional[str] = None
+        self.serial_event_poll_after_id: Optional[str] = None
         self.auto_poll = tk.BooleanVar(value=False)
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
         self.interval_var = tk.IntVar(value=1000)
         self.status_var = tk.StringVar(value="Disconnected")
         self.summary_note_var = tk.StringVar(value="")
+        self.protection_event_var = tk.StringVar(value="Protection event: -")
         self.last_summary: Dict[str, object] = {}
         self.last_limits: Optional[Dict[str, object]] = None
         self._fault_labels: Dict[str, ttk.Label] = {}
@@ -79,6 +82,7 @@ class BmsToolApp(tk.Tk):
         self.refresh_ports()
         self.after(100, self._drain_events)
         self._schedule_summary_poll()
+        self._schedule_serial_event_poll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         logger.info("GUI initialized")
 
@@ -273,6 +277,12 @@ class BmsToolApp(tk.Tk):
         ttk.Label(gate_box, textvariable=self.fault_meta_var, style="Metric.TLabel").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(16, 0)
         )
+        ttk.Label(
+            gate_box,
+            textvariable=self.protection_event_var,
+            style="Warn.TLabel",
+            wraplength=430,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         limits = ttk.LabelFrame(tab, text="Firmware limits", padding=10)
         limits.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
@@ -320,7 +330,7 @@ class BmsToolApp(tk.Tk):
             row=0, column=2, padx=(10, 0)
         )
         for row, key in enumerate(
-            ["status_name", "actual_mA", "measured_mA", "deviation_ppm", "old_gain_ppm", "new_gain_ppm"],
+            ["status_name", "actual_mA", "measured_mA", "deviation_ppm", "new_gain_ppm"],
             start=1,
         ):
             ttk.Label(calibration, text=key).grid(row=row, column=0, sticky="w", pady=3)
@@ -516,6 +526,23 @@ class BmsToolApp(tk.Tk):
             logger.info("Summary poll skipped because serial worker is busy")
         self._schedule_summary_poll()
 
+    def _schedule_serial_event_poll(
+        self,
+        delay_ms: int = SERIAL_EVENT_POLL_INTERVAL_MS,
+    ) -> None:
+        if self.serial_event_poll_after_id is None:
+            self.serial_event_poll_after_id = self.after(delay_ms, self._serial_event_poll_tick)
+
+    def _serial_event_poll_tick(self) -> None:
+        self.serial_event_poll_after_id = None
+        if self.client.is_open and not self.worker_busy:
+            try:
+                self.client.read_pending_events()
+            except Exception as exc:
+                logger.exception("Serial event poll failed")
+                self._log(f"Serial event poll failed: {exc}", logging.ERROR)
+        self._schedule_serial_event_poll()
+
     def _run_worker(self, kind: str, func: Callable[[], object]) -> None:
         if not self.client.is_open:
             messagebox.showwarning("Not connected", "Connect to the BMS UART port first.")
@@ -540,6 +567,9 @@ class BmsToolApp(tk.Tk):
 
         threading.Thread(target=target, daemon=True).start()
 
+    def _queue_serial_event(self, kind: str, payload: object) -> None:
+        self.events.put((kind, payload))
+
     def _drain_events(self) -> None:
         try:
             while True:
@@ -558,9 +588,11 @@ class BmsToolApp(tk.Tk):
                 elif kind == "ping":
                     self._log(f"Ping response: {protocol.to_hex(bytes(payload))}")
                 elif kind == "summary":
-                    self._update_summary(payload)
+                    self._apply_summary(payload)
                     self.summary_note_var.set("")
                     self._log_summary(payload)
+                elif kind == "protection_event":
+                    self._handle_protection_event(payload)
                 elif kind == "read_all":
                     self._update_read_all(payload)
                 elif kind == "otp":
@@ -578,6 +610,21 @@ class BmsToolApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
+
+    def _handle_protection_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            self._log(f"Protection event received: {event}", logging.WARNING)
+            return
+
+        reason = int(event.get("reason", 0) or 0)
+        reason_name = str(event.get("reason_name", f"UNKNOWN(0x{reason:02X})"))
+        fault_name = event.get("fault_name")
+        message = f"Protection event: {reason_name} (0x{reason:02X})"
+        self.protection_event_var.set(message)
+        self.summary_note_var.set(message)
+        if isinstance(fault_name, str) and fault_name in self._fault_labels:
+            self._fault_labels[fault_name].configure(text="ACTIVE", style="Danger.TLabel")
+        self._log(message, logging.WARNING)
 
     def _log_summary(self, summary: object) -> None:
         if not isinstance(summary, dict) or not summary:
@@ -605,7 +652,7 @@ class BmsToolApp(tk.Tk):
         limits = data.get("limits")
 
         if isinstance(summary, dict):
-            self._update_summary(summary)
+            self._apply_summary(summary)
             self.summary_note_var.set("")
         elif isinstance(errors, dict) and "summary" in errors:
             self.summary_note_var.set("READ_SUMMARY unavailable")
@@ -644,6 +691,71 @@ class BmsToolApp(tk.Tk):
             )
         self._log("Read complete: " + " | ".join(details) if details else "Read complete.")
 
+    def _apply_summary(self, summary: Dict[str, object]) -> None:
+        self._update_summary(summary)
+        cells = self._cells_from_summary(summary)
+        if cells is not None:
+            self._update_cells(cells)
+        faults = self._faults_from_summary(summary)
+        if faults is not None:
+            self._update_faults(faults)
+
+    def _cells_from_summary(self, summary: Dict[str, object]) -> Optional[Dict[str, object]]:
+        voltages = summary.get("cell_voltages_mV")
+        if not isinstance(voltages, list):
+            return None
+        return {
+            "cell_count": len(voltages),
+            "cell_voltages_mV": voltages,
+            "min_cell_voltage_mV": summary.get("min_cell_voltage_mV"),
+            "max_cell_voltage_mV": summary.get("max_cell_voltage_mV"),
+            "average_cell_voltage_mV": summary.get("average_cell_voltage_mV"),
+            "delta_cell_voltage_mV": summary.get("delta_cell_voltage_mV"),
+        }
+
+    def _faults_from_summary(self, summary: Dict[str, object]) -> Optional[Dict[str, object]]:
+        has_fault_data = any(
+            key in summary
+            for key in (
+                "fault_bitmap",
+                "faults",
+                "gate_signal_bitmap",
+                "gate_signals",
+                "charge_gate_fault_signal",
+                "discharge_gate_fault_signal",
+                "alert_active",
+                "alert_counter",
+            )
+        )
+        if not has_fault_data:
+            return None
+
+        fault_bitmap = int(summary.get("fault_bitmap", 0) or 0)
+        faults = summary.get("faults")
+        if not isinstance(faults, list):
+            faults = protocol.active_flag_names(fault_bitmap, protocol.FAULT_NAMES)
+
+        gate_signal_bitmap = summary.get("gate_signal_bitmap")
+        if gate_signal_bitmap is None:
+            gate_signal_bitmap = 0
+            gate_signal_bitmap |= 1 << 0 if summary.get("charge_gate_fault_signal") else 0
+            gate_signal_bitmap |= 1 << 1 if summary.get("discharge_gate_fault_signal") else 0
+        gate_signal_bitmap = int(gate_signal_bitmap or 0)
+        gate_signals = summary.get("gate_signals")
+        if not isinstance(gate_signals, list):
+            gate_signals = protocol.active_flag_names(
+                gate_signal_bitmap, protocol.GATE_SIGNAL_NAMES
+            )
+
+        return {
+            "fault_bitmap": fault_bitmap,
+            "faults": faults,
+            "gate_signal_bitmap": gate_signal_bitmap,
+            "gate_signals": gate_signals,
+            "alert_active": summary.get("alert_active"),
+            "alert_counter": summary.get("alert_counter", "-"),
+        }
+
     def _update_summary(self, summary: Dict[str, object]) -> None:
         self.last_summary = summary
 
@@ -676,9 +788,9 @@ class BmsToolApp(tk.Tk):
         else:
             self.raw_summary_text.insert(
                 "end",
-                "READ_SUMMARY did not return data. The reference firmware sends a raw "
-                "BMS_Tracking_t while MAX_PAYLOAD_SIZE is 64, so it can return "
-                "INTERNAL_ERROR until firmware summary is compacted or max payload is raised.\n",
+                "READ_SUMMARY did not return data. The reference firmware sends raw "
+                "BMS_Tracking_t data; check firmware enum size and BMS_UART_MAX_PAYLOAD_SIZE "
+                "if the response returns INTERNAL_ERROR.\n",
             )
         self.raw_summary_text.configure(state="disabled")
 
@@ -786,6 +898,12 @@ class BmsToolApp(tk.Tk):
             except tk.TclError:
                 pass
             self.summary_poll_after_id = None
+        if self.serial_event_poll_after_id is not None:
+            try:
+                self.after_cancel(self.serial_event_poll_after_id)
+            except tk.TclError:
+                pass
+            self.serial_event_poll_after_id = None
         self.auto_poll.set(False)
         self.client.close()
         self.destroy()

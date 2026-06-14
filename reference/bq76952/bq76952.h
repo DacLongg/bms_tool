@@ -11,6 +11,34 @@
 extern "C" {
 #endif
 
+/* Địa chỉ I2C 7-bit của BQ76952 khi giao tiếp ở chế độ chuẩn. */
+#define BQ_I2C_ADDR                 0x08U
+
+#define BQ76952_LOW_POWER_MODE_SLEEP     1U
+#define BQ76952_LOW_POWER_MODE_DEEPSLEEP 2U
+#define BQ76952_LOW_POWER_MODE_SHUTDOWN  3U
+#define BQ76952_LOW_POWER_MODE_DEFAULT   BQ76952_LOW_POWER_MODE_DEEPSLEEP
+
+/* Change only BQ76952_LOW_POWER_MODE_DEFAULT to select the BQ low-power mechanism. */
+#ifndef BQ76952_LOW_POWER_MODE
+#if defined(SHUTDOWN)
+#define BQ76952_LOW_POWER_MODE BQ76952_LOW_POWER_MODE_SHUTDOWN
+#elif defined(SLEEP)
+#define BQ76952_LOW_POWER_MODE BQ76952_LOW_POWER_MODE_SLEEP
+#else
+#define BQ76952_LOW_POWER_MODE BQ76952_LOW_POWER_MODE_DEFAULT
+#endif
+#endif
+
+#if (BQ76952_LOW_POWER_MODE != BQ76952_LOW_POWER_MODE_SLEEP) && \
+    (BQ76952_LOW_POWER_MODE != BQ76952_LOW_POWER_MODE_DEEPSLEEP) && \
+    (BQ76952_LOW_POWER_MODE != BQ76952_LOW_POWER_MODE_SHUTDOWN)
+#error "Invalid BQ76952_LOW_POWER_MODE"
+#endif
+
+#define BQ76952_LOW_POWER_MODE_IS_SHUTDOWN \
+    (BQ76952_LOW_POWER_MODE == BQ76952_LOW_POWER_MODE_SHUTDOWN)
+
 typedef uint8_t byte;
 
 typedef enum
@@ -459,11 +487,14 @@ typedef struct
 
 }BQ76952_RawInfo_t;
 
+/* Khởi tạo tầng I2C software dùng bởi driver này. */
+#define bq76952_begin()  I2C_Soft_Init()
+#define bq76952_write_register(reg, data, len)  (I2C_Soft_WriteDataFromAddress(BQ_I2C_ADDR, reg, (uint8_t *)data, len) == E_OK)
+#define bq76952_read_register(reg, data, len)   (I2C_Soft_ReadDataFromAddress(BQ_I2C_ADDR, reg, data, len) == E_OK)
 
 /* Khởi tạo driver/I2C và kiểm tra metadata cơ bản; BMS chịu trách nhiệm cấu hình runtime. */
 void bq76952_init(void);
-/* Khởi tạo tầng I2C software dùng bởi driver này. */
-void bq76952_begin(void);
+
 /* Reset mềm IC bằng subcommand reset. */
 void bq76952_reset(void);
 /* Chuyển IC vào Config Update mode trước khi ghi data memory. */
@@ -504,6 +535,8 @@ int16_t bq76952_getThermistorTemp(bq76952_thermistor_t thermistor);
 bq76952_protection_t bq76952_getProtectionStatus(void);
 /* Đọc các cờ alert latched nhóm C. */
 bq76952_safety_alert_c_t bq76952_getSafetyAlert_C(void);
+/* Đọc các cờ bảo vệ đang active trong Safety Status C. */
+BQ76952_SafetyStatusC_t bq76952_getSafetyStatus_C(void);
 /* Đọc trạng thái bảo vệ nhiệt độ. */
 bq76952_temp_t bq76952_getTemperatureStatus(void);
 /* Điều khiển FET sạc/xả bằng subcommand của BQ76952. */
@@ -519,7 +552,11 @@ bool bq76952_isDischarging(void);
 /* Legacy alias for bq76952_isChargeFetOn(). */
 bool bq76952_isCharging(void);
 /* Bật/tắt host/manual cell balancing trong data memory của BQ. */
-bool bq76952_setCellBalancingEnabled(bool enabled);
+bool bq76952_ConfigManualCellBalancing(int8_t min_cell_temp_c,
+                                              int8_t max_cell_temp_c,
+                                              int8_t max_internal_temp_c,
+                                              uint8_t interval_s,
+                                              uint8_t max_cells);
 /* Cấu hình BQ tự chọn cell balancing trong charge/relax/sleep theo policy truyền vào. */
 bool bq76952_configureAutonomousCellBalancing(uint16_t min_cell_mv,
                                               uint8_t start_delta_mv,
@@ -593,9 +630,9 @@ bool bq76952_program_OTP(void);
 bool bq76952_setEnablePreRegulator(void);
 /* Bật REG0, REG1 và REG2 theo nguồn trên board. */
 bool bq76952_configurePowerOutputs(void);
-/* Cho phép BQ vào SLEEP tự động nhưng giữ REG2 cấp nguồn hệ thống. */
+/* Prepare the BQ for the low-power policy selected in bq76952.c. */
 bool bq76952_prepareSleepWithReg2(void);
-/* Không cho BQ tự vào SLEEP nữa sau khi hệ thống thức. */
+/* Resume/re-arm BQ power outputs after the selected low-power policy exits. */
 void bq76952_resumeFromSleep(void);
 /* Cấu hình gain đo dòng cho shunt 0.5 mOhm trên board, scale theo ppm. */
 bool bq76952_setCurrentSenseCalibration(uint32_t gain_ppm);
@@ -619,7 +656,7 @@ bool bq76952_setDCHGPinConfig(bool active_low);
 bool bq76952_setDDSGPinConfig(bool active_low);
 /* Cấu hình mask mặc định của alarm status. */
 bool bq76952_setDefaultAlarmMaskConfig(void);
-/* Cấu hình điều kiện BQ thoát sleep và tạo WAKE alarm khi có dòng sạc/xả. */
+/* Configure BQ low-power behavior for the policy selected in bq76952.c. */
 bool bq76952_configureSleepWake(void);
 /* Chọn cell nào được tham gia phép đo điện áp bằng bitmask VCELL_MODE. */
 bool bq76952_setVcellMode(uint16_t vcell_mode);

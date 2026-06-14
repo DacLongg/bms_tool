@@ -26,10 +26,7 @@ Set `BMS_TOOL_LOG_LEVEL=DEBUG` before running to include raw UART TX/RX frames.
 
 ## Firmware note
 
-The reference header sets `BMS_UART_MAX_PAYLOAD_SIZE` to `64`, while the current
-`READ_SUMMARY` handler sends `sizeof(BMS_Tracking_t)`. That struct is larger
-than 64 bytes on normal STM32/GCC layouts, so the firmware can reply
-`INTERNAL_ERROR` for `READ_SUMMARY`. The app keeps working with `READ_CELLS`,
-`READ_FAULTS`, and `READ_LIMITS`, and will parse summary payloads if the
-firmware is changed to use the compact commented-out summary or a larger max
-payload.
+The reference header now sets `BMS_UART_MAX_PAYLOAD_SIZE` to `160`, and the
+current `READ_SUMMARY` handler sends raw `sizeof(BMS_Tracking_t)`. The app
+parses the current 152-byte short-enum layout and also keeps compatibility with
+the 160-byte normal-enum layout if the firmware build options change.
