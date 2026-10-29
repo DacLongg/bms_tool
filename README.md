@@ -19,14 +19,17 @@ Set `BMS_TOOL_LOG_LEVEL=DEBUG` before running to include raw UART TX/RX frames.
 
 - Connect to a COM port with pyserial.
 - Read cells, faults, limits, and summary data.
+- Read current, compact status/SOC, pack voltage, cell count, TS1 temperature,
+  and completed cycle count (`0x14`-`0x19`).
 - Auto-poll at a configurable interval.
+- Enable or disable the balancing algorithm (`0x31`).
 - Send current calibration command (`CMD_CALIBRATE_CURRENT`, `0x30`).
 - Run OTP check/read/write commands (`0x20`, `0x22`, `0x21`).
 - Send a custom command byte with custom hex payload.
 
 ## Firmware note
 
-The reference header now sets `BMS_UART_MAX_PAYLOAD_SIZE` to `160`, and the
-current `READ_SUMMARY` handler sends raw `sizeof(BMS_Tracking_t)`. The app
-parses the current 152-byte short-enum layout and also keeps compatibility with
-the 160-byte normal-enum layout if the firmware build options change.
+The implementation follows `BMS_UART_Protocol_For_Partner.md` v1.3. The
+current `READ_SUMMARY` response contains the documented 124-byte GCC/ARM
+`BMS_Tracking_t` layout. Legacy 152/160-byte captures remain readable, but new
+integrations should prefer the stable dedicated read commands (`0x11`-`0x19`).

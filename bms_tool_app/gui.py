@@ -68,6 +68,7 @@ class BmsToolApp(tk.Tk):
         self.status_var = tk.StringVar(value="Disconnected")
         self.summary_note_var = tk.StringVar(value="")
         self.protection_event_var = tk.StringVar(value="Protection event: -")
+        self.balancing_status_var = tk.StringVar(value="Balancing mode: -")
         self.last_summary: Dict[str, object] = {}
         self.last_limits: Optional[Dict[str, object]] = None
         self._fault_labels: Dict[str, ttk.Label] = {}
@@ -181,7 +182,7 @@ class BmsToolApp(tk.Tk):
         pack_fields = [
             ("state_name", "State"),
             ("current_direction_name", "Current direction"),
-            ("stack_voltage_mV", "Stack voltage"),
+            ("soc_percent", "Estimated SOC"),
             ("pack_voltage_mV", "Pack voltage"),
             ("bat_adc_estimated_pack_mV", "BAT ADC estimate"),
             ("current_mA", "Current"),
@@ -198,10 +199,11 @@ class BmsToolApp(tk.Tk):
             ("discharging", "Discharging"),
             ("fets", "FET flags"),
             ("balance_required", "Balance required"),
+            ("balancing_enabled", "Balancing enabled"),
             ("balance_mask", "Balance mask"),
             ("alert_active", "Alert active"),
             ("alert_counter", "Alert counter"),
-            ("circle_counter", "Loop counter"),
+            ("completed_cycle_count", "Completed cycles"),
             ("current_calibration_gain_ppm", "Current cal gain"),
         ]
         self._add_metric_grid(left, pack_fields)
@@ -375,8 +377,26 @@ class BmsToolApp(tk.Tk):
                 row=row, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=2
             )
 
+        balancing = ttk.LabelFrame(tab, text="Cell balancing", padding=10)
+        balancing.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(
+            balancing,
+            text="Enable",
+            command=lambda: self.set_balancing(True),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            balancing,
+            text="Disable and clear mask",
+            command=lambda: self.set_balancing(False),
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(
+            balancing,
+            textvariable=self.balancing_status_var,
+            style="Metric.TLabel",
+        ).grid(row=0, column=2, sticky="w", padx=(16, 0))
+
         custom = ttk.LabelFrame(tab, text="Custom frame", padding=10)
-        custom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        custom.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         custom.columnconfigure(3, weight=1)
         ttk.Label(custom, text="Command hex").grid(row=0, column=0, sticky="w")
         self.custom_command_var = tk.StringVar(value="01")
@@ -479,6 +499,9 @@ class BmsToolApp(tk.Tk):
             messagebox.showwarning("Invalid value", "Actual current must be an integer mA value.")
             return
         self._run_worker("calibration", lambda: self.client.calibrate_current(actual))
+
+    def set_balancing(self, enabled: bool) -> None:
+        self._run_worker("balancing", lambda: self.client.set_balancing(enabled))
 
     def send_custom_frame(self) -> None:
         try:
@@ -601,6 +624,16 @@ class BmsToolApp(tk.Tk):
                 elif kind == "calibration":
                     self._update_calibration(payload)
                     self._log("Calibration response received.")
+                elif kind == "balancing":
+                    enabled = bool(payload.get("enabled"))
+                    self.balancing_status_var.set(
+                        "Balancing mode: enabled" if enabled else "Balancing mode: disabled"
+                    )
+                    self.last_summary["balancing_enabled"] = enabled
+                    if not enabled:
+                        self.last_summary["balance_mask"] = 0
+                    self._apply_summary(self.last_summary)
+                    self._log(self.balancing_status_var.get())
                 elif kind == "custom":
                     command, data = payload
                     self.custom_response_var.set(
@@ -650,9 +683,24 @@ class BmsToolApp(tk.Tk):
         cells = data.get("cells")
         faults = data.get("faults")
         limits = data.get("limits")
+        current = data.get("current")
+        status = data.get("status")
+        pack_voltage = data.get("pack_voltage")
+        cell_count = data.get("cell_count")
+        temperature = data.get("temperature")
+        cycle_count = data.get("cycle_count")
 
-        if isinstance(summary, dict):
-            self._apply_summary(summary)
+        combined_summary: Dict[str, object] = dict(summary) if isinstance(summary, dict) else {}
+        for dedicated in (current, status, pack_voltage, cell_count, cycle_count):
+            if isinstance(dedicated, dict):
+                combined_summary.update(dedicated)
+        if isinstance(temperature, dict):
+            combined_summary["ts1_temperature_C"] = temperature.get("temperature_C")
+            if "temperature_C" not in combined_summary:
+                combined_summary["temperature_C"] = [temperature.get("temperature_C")]
+
+        if combined_summary:
+            self._apply_summary(combined_summary)
             self.summary_note_var.set("")
         elif isinstance(errors, dict) and "summary" in errors:
             self.summary_note_var.set("READ_SUMMARY unavailable")
@@ -666,12 +714,12 @@ class BmsToolApp(tk.Tk):
             self._update_limits(limits)
 
         details: list[str] = []
-        if isinstance(summary, dict) and summary:
+        if combined_summary:
             details.append(
                 "state={state} pack={pack} current={current}".format(
-                    state=summary.get("state_name", "-"),
-                    pack=_fmt_mv(summary.get("pack_voltage_mV")),
-                    current=_fmt_ma(summary.get("current_mA")),
+                    state=combined_summary.get("state_name", "-"),
+                    pack=_fmt_mv(combined_summary.get("pack_voltage_mV")),
+                    current=_fmt_ma(combined_summary.get("current_mA")),
                 )
             )
         if isinstance(cells, dict):
@@ -758,6 +806,12 @@ class BmsToolApp(tk.Tk):
 
     def _update_summary(self, summary: Dict[str, object]) -> None:
         self.last_summary = summary
+        if "balancing_enabled" in summary:
+            self.balancing_status_var.set(
+                "Balancing mode: enabled"
+                if summary.get("balancing_enabled")
+                else "Balancing mode: disabled"
+            )
 
         def value_for(key: str) -> str:
             value = summary.get(key)
@@ -765,8 +819,13 @@ class BmsToolApp(tk.Tk):
                 return _fmt_mv(value)
             if key == "current_mA":
                 return _fmt_ma(value)
-            if key in {"initialized", "connected", "charging", "discharging", "balance_required", "alert_active"}:
+            if key in {
+                "initialized", "connected", "charging", "discharging",
+                "balance_required", "balancing_enabled", "alert_active",
+            }:
                 return _fmt_bool(value)
+            if key == "soc_percent":
+                return "-" if value is None else f"{value}%"
             if key == "temperature_C" and isinstance(value, list):
                 return ", ".join(f"{temp} C" for temp in value)
             if key == "fets" and isinstance(value, list):

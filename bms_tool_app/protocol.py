@@ -21,6 +21,7 @@ RESPONSE_FLAG = 0x80
 PROTOCOL_VERSION = 0x04
 MAX_PAYLOAD_SIZE = 160
 OTP_WRITE_MAGIC = b"OTP!"
+RAW_TRACKING_SIZE = 124
 RAW_TRACKING_SHORT_ENUM_SIZE = 152
 RAW_TRACKING_STANDARD_ENUM_SIZE = 160
 COMPACT_SUMMARY_SIZE = 51
@@ -31,10 +32,17 @@ CMD_READ_SUMMARY = 0x10
 CMD_READ_CELLS = 0x11
 CMD_READ_FAULTS = 0x12
 CMD_READ_LIMITS = 0x13
+CMD_READ_CURRENT = 0x14
+CMD_READ_STATUS = 0x15
+CMD_READ_PACK_VOLTAGE = 0x16
+CMD_READ_CELL_COUNT = 0x17
+CMD_READ_TEMPERATURE = 0x18
+CMD_READ_CYCLE_COUNT = 0x19
 CMD_OTP_CHECK = 0x20
 CMD_OTP_WRITE = 0x21
 CMD_OTP_READ = 0x22
 CMD_CALIBRATE_CURRENT = 0x30
+CMD_SET_BALANCING = 0x31
 CMD_PROTECTION_EVENT = 0x40
 
 COMMAND_NAMES = {
@@ -43,10 +51,17 @@ COMMAND_NAMES = {
     CMD_READ_CELLS: "READ_CELLS",
     CMD_READ_FAULTS: "READ_FAULTS",
     CMD_READ_LIMITS: "READ_LIMITS",
+    CMD_READ_CURRENT: "READ_CURRENT",
+    CMD_READ_STATUS: "READ_STATUS",
+    CMD_READ_PACK_VOLTAGE: "READ_PACK_VOLTAGE",
+    CMD_READ_CELL_COUNT: "READ_CELL_COUNT",
+    CMD_READ_TEMPERATURE: "READ_TEMPERATURE",
+    CMD_READ_CYCLE_COUNT: "READ_CYCLE_COUNT",
     CMD_OTP_CHECK: "OTP_CHECK",
     CMD_OTP_WRITE: "OTP_WRITE",
     CMD_OTP_READ: "OTP_READ",
     CMD_CALIBRATE_CURRENT: "CALIBRATE_CURRENT",
+    CMD_SET_BALANCING: "SET_BALANCING",
     CMD_PROTECTION_EVENT: "PROTECTION_EVENT",
 }
 
@@ -152,11 +167,30 @@ OTP_FLAG_NAMES = [
 
 CALIBRATION_STATUS_NAMES = {
     0: "OK",
-    1: "BAD_INPUT",
-    2: "ZERO_READING",
+    1: "ACTUAL_CURRENT_ZERO",
+    2: "MEASURED_CURRENT_ZERO",
     3: "DEVIATION_TOO_HIGH",
     4: "WRITE_FAILED",
 }
+
+STATUS_STATE_FLAG_NAMES = [
+    "Charging",
+    "Discharging",
+    "Charge FET enabled",
+    "Discharge FET enabled",
+    "Balancing active",
+    "Balancing enabled",
+]
+
+STATUS_FAULT_FLAG_NAMES = [
+    "Cell over voltage",
+    "Cell under voltage",
+    "Charge over current",
+    "Discharge over current",
+    "Charge/discharge over temperature",
+    "Under temperature",
+    "Short circuit",
+]
 
 
 class ProtocolError(Exception):
@@ -213,7 +247,7 @@ def build_frame(command: int, payload: bytes = b"") -> bytes:
 class FrameParser:
     """Streaming parser for BMS UART frames."""
 
-    def __init__(self, max_payload: int = 255) -> None:
+    def __init__(self, max_payload: int = MAX_PAYLOAD_SIZE) -> None:
         self.max_payload = max_payload
         self._buffer = bytearray()
 
@@ -283,6 +317,13 @@ def make_calibration_payload(actual_ma: int) -> bytes:
     return struct.pack("<i", int(actual_ma))
 
 
+def make_balancing_payload(enabled: object) -> bytes:
+    mode = int(enabled)
+    if mode not in (0, 1):
+        raise ValueError("balancing mode must be 0 (disabled) or 1 (enabled)")
+    return bytes([mode])
+
+
 def active_flag_names(bitmap: int, names: Iterable[str]) -> List[str]:
     return [name for bit, name in enumerate(names) if bitmap & (1 << bit)]
 
@@ -340,6 +381,19 @@ class PayloadReader:
         self.pos += 8
         return value
 
+    def finish(self) -> None:
+        if self.remaining() != 0:
+            raise ProtocolError(
+                f"payload has {self.remaining()} unexpected byte(s) at offset {self.pos}"
+            )
+
+
+def _require_length(data: bytes, expected: int, name: str) -> None:
+    if len(data) != expected:
+        raise ProtocolError(
+            f"{name} payload must be {expected} byte(s); got {len(data)}"
+        )
+
 
 def _u8(data: bytes, offset: int) -> int:
     return data[offset]
@@ -396,6 +450,7 @@ def parse_cells(data: bytes) -> Dict[str, object]:
     reader = PayloadReader(data)
     count = reader.u8()
     voltages = [reader.u16() for _ in range(count)]
+    reader.finish()
     return {
         "cell_count": count,
         "cell_voltages_mV": voltages,
@@ -409,6 +464,7 @@ def parse_cells(data: bytes) -> Dict[str, object]:
 
 
 def parse_faults(data: bytes) -> Dict[str, object]:
+    _require_length(data, 8, "READ_FAULTS")
     reader = PayloadReader(data)
     fault_bitmap = reader.u16()
     gate_signal_bitmap = reader.u8()
@@ -425,6 +481,7 @@ def parse_faults(data: bytes) -> Dict[str, object]:
 
 
 def parse_protection_event(data: bytes) -> Dict[str, object]:
+    _require_length(data, 1, "PROTECTION_EVENT")
     reader = PayloadReader(data)
     reason = reader.u8()
     return {
@@ -436,6 +493,7 @@ def parse_protection_event(data: bytes) -> Dict[str, object]:
 
 
 def parse_limits(data: bytes) -> Dict[str, object]:
+    _require_length(data, 32, "READ_LIMITS")
     reader = PayloadReader(data)
     return {
         "cell_count": reader.u8(),
@@ -455,7 +513,63 @@ def parse_limits(data: bytes) -> Dict[str, object]:
     }
 
 
+def parse_current(data: bytes) -> Dict[str, object]:
+    _require_length(data, 4, "READ_CURRENT")
+    return {"current_mA": struct.unpack("<i", data)[0]}
+
+
+def parse_status(data: bytes) -> Dict[str, object]:
+    _require_length(data, 4, "READ_STATUS")
+    soc_percent, state_flags, fault_flags = struct.unpack("<BBH", data)
+    return {
+        "soc_percent": soc_percent,
+        "state_flags": state_flags,
+        "state_flag_names": active_flag_names(state_flags, STATUS_STATE_FLAG_NAMES),
+        "fault_flags": fault_flags,
+        "fault_flag_names": active_flag_names(fault_flags, STATUS_FAULT_FLAG_NAMES),
+        "charging": bool(state_flags & (1 << 0)),
+        "discharging": bool(state_flags & (1 << 1)),
+        "charge_fet_enabled": bool(state_flags & (1 << 2)),
+        "discharge_fet_enabled": bool(state_flags & (1 << 3)),
+        "balancing_active": bool(state_flags & (1 << 4)),
+        "balancing_enabled": bool(state_flags & (1 << 5)),
+    }
+
+
+def parse_pack_voltage(data: bytes) -> Dict[str, object]:
+    _require_length(data, 4, "READ_PACK_VOLTAGE")
+    return {"pack_voltage_mV": struct.unpack("<I", data)[0]}
+
+
+def parse_cell_count(data: bytes) -> Dict[str, object]:
+    _require_length(data, 1, "READ_CELL_COUNT")
+    return {"cell_count": data[0]}
+
+
+def parse_temperature(data: bytes) -> Dict[str, object]:
+    _require_length(data, 2, "READ_TEMPERATURE")
+    temperature_deci_c = struct.unpack("<h", data)[0]
+    return {
+        "temperature_deciC": temperature_deci_c,
+        "temperature_C": temperature_deci_c / 10.0,
+    }
+
+
+def parse_cycle_count(data: bytes) -> Dict[str, object]:
+    _require_length(data, 4, "READ_CYCLE_COUNT")
+    return {"completed_cycle_count": struct.unpack("<I", data)[0]}
+
+
+def parse_balancing(data: bytes) -> Dict[str, object]:
+    _require_length(data, 1, "SET_BALANCING")
+    mode = data[0]
+    if mode not in (0, 1):
+        raise ProtocolError(f"SET_BALANCING returned invalid mode 0x{mode:02X}")
+    return {"mode": mode, "enabled": bool(mode)}
+
+
 def parse_otp_status(data: bytes) -> Dict[str, object]:
+    _require_length(data, 27, "OTP status")
     reader = PayloadReader(data)
     flags = reader.u16()
     result = {
@@ -533,12 +647,15 @@ def parse_current_calibration_result(
 
 
 def parse_summary(data: bytes) -> Dict[str, object]:
-    """Parse either the compact summary payload or the raw BMS_Tracking_t payload.
+    """Parse the current 124-byte raw tracking payload or a legacy variant.
 
-    Current reference firmware sends the raw struct. This parser still supports
-    compact summary payloads for firmware variants where that path is enabled.
+    Protocol document v1.3 defines the current GCC/ARM layout as 124 bytes.
+    Older compact and 152/160-byte raw layouts remain readable so saved captures
+    from older firmware do not become unusable.
     """
 
+    if len(data) == RAW_TRACKING_SIZE:
+        return parse_current_tracking_summary(data)
     if len(data) >= COMPACT_SUMMARY_SIZE and data[0] == PROTOCOL_VERSION:
         return parse_compact_summary(data)
     if len(data) >= RAW_TRACKING_SHORT_ENUM_SIZE:
@@ -548,6 +665,82 @@ def parse_summary(data: bytes) -> Dict[str, object]:
         "payload_length": len(data),
         "raw_hex": data.hex(" "),
     }
+
+
+def parse_current_tracking_summary(data: bytes) -> Dict[str, object]:
+    """Parse the 124-byte BMS_Tracking_t layout documented by protocol v1.3."""
+
+    _require_length(data, RAW_TRACKING_SIZE, "READ_SUMMARY")
+    initialized = _bool(data, 0)
+    connected = _bool(data, 1)
+    state = _u8(data, 2)
+    current_direction = _u8(data, 3)
+    cell_index_accumulated = list(data[4:14])
+    real_time_accumulated = [_u16(data, 14 + i * 2) for i in range(10)]
+    cell_voltages = [_u16(data, 34 + i * 2) for i in range(10)]
+    fault_values = [_bool(data, 82 + i) for i in range(len(FAULT_NAMES))]
+    fault_bitmap = _fault_bitmap_from_bools(fault_values)
+    charge_gate_signal = _bool(data, 94)
+    discharge_gate_signal = _bool(data, 95)
+    gate_signal_bitmap = (
+        (1 if charge_gate_signal else 0)
+        | (2 if discharge_gate_signal else 0)
+    )
+
+    summary: Dict[str, object] = {
+        "summary_format": "raw_tracking_v1_3",
+        "payload_length": len(data),
+        "parsed_length": RAW_TRACKING_SIZE,
+        "initialized": initialized,
+        "connected": connected,
+        "state": state,
+        "state_name": STATE_NAMES.get(state, f"UNKNOWN({state})"),
+        "current_direction": current_direction,
+        "current_direction_name": CURRENT_DIRECTION_NAMES.get(
+            current_direction, f"UNKNOWN({current_direction})"
+        ),
+        "cell_index_accumulated": cell_index_accumulated,
+        "cell_real_time_accumulated": real_time_accumulated,
+        "cell_voltages_mV": cell_voltages,
+        "min_cell_voltage_mV": _u16(data, 54),
+        "max_cell_voltage_mV": _u16(data, 56),
+        "average_cell_voltage_mV": _u16(data, 58),
+        "delta_cell_voltage_mV": _u16(data, 60),
+        "pack_voltage_mV": _u16(data, 62),
+        "current_mA": _i32(data, 64),
+        "temperature_C": [_i16(data, 68), _i16(data, 70)],
+        "charging": _bool(data, 72),
+        "discharging": _bool(data, 73),
+        "charge_fet_enabled": _bool(data, 74),
+        "discharge_fet_enabled": _bool(data, 75),
+        "fets_enabled": _bool(data, 76),
+        "bq_charge_fet_blocked": _bool(data, 77),
+        "bq_discharge_fet_blocked": _bool(data, 78),
+        "bq_alarm_raw_status": _u16(data, 80),
+        "fault_bitmap": fault_bitmap,
+        "faults": active_flag_names(fault_bitmap, FAULT_NAMES),
+        "charge_disabled": _bool(data, 92),
+        "discharge_disabled": _bool(data, 93),
+        "charge_gate_fault_signal": charge_gate_signal,
+        "discharge_gate_fault_signal": discharge_gate_signal,
+        "gate_signal_bitmap": gate_signal_bitmap,
+        "gate_signals": active_flag_names(gate_signal_bitmap, GATE_SIGNAL_NAMES),
+        "fetoff_asserted": _bool(data, 96),
+        "alert_active": _bool(data, 97),
+        "alert_counter": _u32(data, 100),
+        "bq_sleep_mode": _bool(data, 104),
+        "bq_sleep_allowed": _bool(data, 105),
+        "bat_sense_enabled": _bool(data, 106),
+        "bat_adc_estimated_pack_mV": _u16(data, 108),
+        "balance_required": _bool(data, 110),
+        "balance_mask": _u16(data, 112),
+        "completed_cycle_count": _u32(data, 116),
+        "current_calibration_gain_ppm": _u32(data, 120),
+    }
+    fet_bitmap = _fet_bitmap_from_summary(summary)
+    summary["fet_bitmap"] = fet_bitmap
+    summary["fets"] = active_flag_names(fet_bitmap, FET_NAMES)
+    return summary
 
 
 def parse_compact_summary(data: bytes) -> Dict[str, object]:

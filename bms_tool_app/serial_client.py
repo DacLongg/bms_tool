@@ -226,6 +226,10 @@ class BmsSerialClient:
         return handled
 
     def ping(self, payload: bytes = b"BMS") -> bytes:
+        if len(payload) >= protocol.MAX_PAYLOAD_SIZE:
+            raise protocol.PayloadTooLargeError(
+                "PING payload is limited to 159 bytes because its response adds STATUS"
+            )
         return self.request(protocol.CMD_PING, payload)
 
     def read_summary(self) -> Dict[str, object]:
@@ -239,6 +243,26 @@ class BmsSerialClient:
 
     def read_limits(self) -> Dict[str, object]:
         return protocol.parse_limits(self.request(protocol.CMD_READ_LIMITS))
+
+    def read_current(self) -> Dict[str, object]:
+        return protocol.parse_current(self.request(protocol.CMD_READ_CURRENT))
+
+    def read_status(self) -> Dict[str, object]:
+        return protocol.parse_status(self.request(protocol.CMD_READ_STATUS))
+
+    def read_pack_voltage(self) -> Dict[str, object]:
+        return protocol.parse_pack_voltage(
+            self.request(protocol.CMD_READ_PACK_VOLTAGE)
+        )
+
+    def read_cell_count(self) -> Dict[str, object]:
+        return protocol.parse_cell_count(self.request(protocol.CMD_READ_CELL_COUNT))
+
+    def read_temperature(self) -> Dict[str, object]:
+        return protocol.parse_temperature(self.request(protocol.CMD_READ_TEMPERATURE))
+
+    def read_cycle_count(self) -> Dict[str, object]:
+        return protocol.parse_cycle_count(self.request(protocol.CMD_READ_CYCLE_COUNT))
 
     def otp_check(self) -> Dict[str, object]:
         return protocol.parse_otp_status(self.request(protocol.CMD_OTP_CHECK, timeout_s=2.0))
@@ -273,6 +297,13 @@ class BmsSerialClient:
             actual_ma=actual_ma,
         )
 
+    def set_balancing(self, enabled: bool) -> Dict[str, object]:
+        data = self.request(
+            protocol.CMD_SET_BALANCING,
+            protocol.make_balancing_payload(enabled),
+        )
+        return protocol.parse_balancing(data)
+
     def read_all(self) -> Dict[str, object]:
         result: Dict[str, object] = {"errors": {}}
         for key, reader in (
@@ -280,6 +311,12 @@ class BmsSerialClient:
             ("cells", self.read_cells),
             ("faults", self.read_faults),
             ("limits", self.read_limits),
+            ("current", self.read_current),
+            ("status", self.read_status),
+            ("pack_voltage", self.read_pack_voltage),
+            ("cell_count", self.read_cell_count),
+            ("temperature", self.read_temperature),
+            ("cycle_count", self.read_cycle_count),
         ):
             try:
                 result[key] = reader()
