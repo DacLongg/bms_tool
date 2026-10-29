@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -59,6 +60,7 @@ class BmsToolApp(tk.Tk):
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.client = BmsSerialClient(event_callback=self._queue_serial_event)
         self.worker_busy = False
+        self.api_test_active = False
         self.summary_poll_after_id: Optional[str] = None
         self.serial_event_poll_after_id: Optional[str] = None
         self.auto_poll = tk.BooleanVar(value=False)
@@ -113,7 +115,10 @@ class BmsToolApp(tk.Tk):
         self._build_cells_tab(notebook)
         self._build_faults_tab(notebook)
         self._build_controls_tab(notebook)
+        self._build_api_test_tab(notebook)
         self._build_log_tab(notebook)
+        self.notebook = notebook
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         status_bar = ttk.Frame(root)
         status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -414,6 +419,151 @@ class BmsToolApp(tk.Tk):
             row=1, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
 
+    def _build_api_test_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook, padding=12)
+        notebook.add(tab, text="API Test")
+        self.api_test_tab = tab
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            tab,
+            text=(
+                "Periodic READ_SUMMARY and Auto Read are paused while this tab is active. "
+                "Select one API at a time; PROTECTION_EVENT is received passively."
+            ),
+            style="Warn.TLabel",
+            wraplength=1000,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+
+        commands = ttk.LabelFrame(tab, text="Protocol APIs", padding=10)
+        commands.grid(row=1, column=0, sticky="nsw", padx=(0, 10))
+
+        api_buttons = [
+            ("01  PING", lambda: self._api_test_ping()),
+            (
+                "10  READ_SUMMARY",
+                lambda: self._run_api_test("READ_SUMMARY (0x10)", self.client.read_summary),
+            ),
+            (
+                "11  READ_CELLS",
+                lambda: self._run_api_test("READ_CELLS (0x11)", self.client.read_cells),
+            ),
+            (
+                "12  READ_FAULTS",
+                lambda: self._run_api_test("READ_FAULTS (0x12)", self.client.read_faults),
+            ),
+            (
+                "13  READ_LIMITS",
+                lambda: self._run_api_test("READ_LIMITS (0x13)", self.client.read_limits),
+            ),
+            (
+                "14  READ_CURRENT",
+                lambda: self._run_api_test("READ_CURRENT (0x14)", self.client.read_current),
+            ),
+            (
+                "15  READ_STATUS",
+                lambda: self._run_api_test("READ_STATUS (0x15)", self.client.read_status),
+            ),
+            (
+                "16  READ_PACK_VOLTAGE",
+                lambda: self._run_api_test(
+                    "READ_PACK_VOLTAGE (0x16)", self.client.read_pack_voltage
+                ),
+            ),
+            (
+                "17  READ_CELL_COUNT",
+                lambda: self._run_api_test(
+                    "READ_CELL_COUNT (0x17)", self.client.read_cell_count
+                ),
+            ),
+            (
+                "18  READ_TEMPERATURE",
+                lambda: self._run_api_test(
+                    "READ_TEMPERATURE (0x18)", self.client.read_temperature
+                ),
+            ),
+            (
+                "19  READ_CYCLE_COUNT",
+                lambda: self._run_api_test(
+                    "READ_CYCLE_COUNT (0x19)", self.client.read_cycle_count
+                ),
+            ),
+            (
+                "20  OTP_CHECK",
+                lambda: self._run_api_test("OTP_CHECK (0x20)", self.client.otp_check),
+            ),
+            ("21  OTP_WRITE", self._api_test_otp_write),
+            (
+                "22  OTP_READ",
+                lambda: self._run_api_test("OTP_READ (0x22)", self.client.otp_read),
+            ),
+            ("30  CALIBRATE_CURRENT", self._api_test_calibrate),
+            ("31  SET_BALANCING", self._api_test_balancing),
+        ]
+        for index, (label, command) in enumerate(api_buttons):
+            row = index // 2
+            column = index % 2
+            ttk.Button(commands, text=label, command=command, width=25).grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=(0 if column == 0 else 6, 0),
+                pady=3,
+            )
+
+        ttk.Button(
+            commands,
+            text="40  PROTECTION_EVENT (passive)",
+            state="disabled",
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        inputs = ttk.LabelFrame(commands, text="Request inputs", padding=8)
+        inputs.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        inputs.columnconfigure(1, weight=1)
+        ttk.Label(inputs, text="PING payload (hex)").grid(row=0, column=0, sticky="w")
+        self.api_ping_payload_var = tk.StringVar(value="42 4D 53")
+        ttk.Entry(inputs, textvariable=self.api_ping_payload_var, width=24).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+        ttk.Label(inputs, text="Calibration actual mA").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        self.api_calibration_var = tk.StringVar(value="1000")
+        ttk.Entry(inputs, textvariable=self.api_calibration_var, width=16).grid(
+            row=1, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Label(inputs, text="Balancing mode").grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+        self.api_balancing_var = tk.StringVar(value="Enable (01)")
+        ttk.Combobox(
+            inputs,
+            textvariable=self.api_balancing_var,
+            values=("Enable (01)", "Disable (00)"),
+            state="readonly",
+            width=18,
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+        ttk.Label(
+            inputs,
+            textvariable=self.protection_event_var,
+            style="Warn.TLabel",
+            wraplength=430,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        result = ttk.LabelFrame(tab, text="Selected API result", padding=10)
+        result.grid(row=1, column=1, sticky="nsew")
+        result.columnconfigure(0, weight=1)
+        result.rowconfigure(0, weight=1)
+        self.api_result_text = tk.Text(result, wrap="word", font=("Consolas", 10))
+        self.api_result_text.grid(row=0, column=0, sticky="nsew")
+        api_scroll = ttk.Scrollbar(
+            result, orient=tk.VERTICAL, command=self.api_result_text.yview
+        )
+        api_scroll.grid(row=0, column=1, sticky="ns")
+        self.api_result_text.configure(yscrollcommand=api_scroll.set, state="disabled")
+        self._show_api_result("Select an API button to send a request.\n")
+
     def _build_log_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=12)
         notebook.add(tab, text="Log")
@@ -503,6 +653,78 @@ class BmsToolApp(tk.Tk):
     def set_balancing(self, enabled: bool) -> None:
         self._run_worker("balancing", lambda: self.client.set_balancing(enabled))
 
+    def _run_api_test(self, label: str, func: Callable[[], object]) -> None:
+        def execute() -> Dict[str, object]:
+            try:
+                return {"label": label, "result": func()}
+            except Exception as exc:
+                raise RuntimeError(f"{label}: {exc}") from exc
+
+        self._run_worker("api_test", execute)
+
+    def _api_test_ping(self) -> None:
+        try:
+            payload = protocol.from_hex(self.api_ping_payload_var.get())
+        except ValueError as exc:
+            messagebox.showwarning("Invalid PING payload", str(exc))
+            return
+        self._run_api_test("PING (0x01)", lambda: self.client.ping(payload))
+
+    def _api_test_calibrate(self) -> None:
+        try:
+            actual_ma = int(self.api_calibration_var.get().strip())
+        except ValueError:
+            messagebox.showwarning(
+                "Invalid calibration value",
+                "Actual current must be an integer mA value.",
+            )
+            return
+        self._run_api_test(
+            "CALIBRATE_CURRENT (0x30)",
+            lambda: self.client.calibrate_current(actual_ma),
+        )
+
+    def _api_test_balancing(self) -> None:
+        enabled = self.api_balancing_var.get().startswith("Enable")
+        self._run_api_test(
+            "SET_BALANCING (0x31)",
+            lambda: self.client.set_balancing(enabled),
+        )
+
+    def _api_test_otp_write(self) -> None:
+        ok = messagebox.askyesno(
+            "Confirm OTP write",
+            "OTP write is permanent on the BQ device. Continue?",
+        )
+        if ok:
+            self._run_api_test("OTP_WRITE (0x21)", self.client.otp_write)
+
+    def _show_api_result(self, message: str) -> None:
+        self.api_result_text.configure(state="normal")
+        self.api_result_text.delete("1.0", "end")
+        self.api_result_text.insert("end", message)
+        self.api_result_text.configure(state="disabled")
+
+    def _on_tab_changed(self, _event: object = None) -> None:
+        active = self.notebook.select() == str(self.api_test_tab)
+        if active == self.api_test_active:
+            return
+        self.api_test_active = active
+        if active:
+            if self.summary_poll_after_id is not None:
+                try:
+                    self.after_cancel(self.summary_poll_after_id)
+                except tk.TclError:
+                    pass
+                self.summary_poll_after_id = None
+            self.summary_note_var.set("Periodic reads paused in API Test tab")
+            self._log("API Test opened: periodic read commands paused.")
+        else:
+            if self.summary_note_var.get() == "Periodic reads paused in API Test tab":
+                self.summary_note_var.set("")
+            self._schedule_summary_poll(0)
+            self._log("API Test closed: periodic read commands resumed.")
+
     def send_custom_frame(self) -> None:
         try:
             command = int(self.custom_command_var.get().strip(), 16)
@@ -524,12 +746,12 @@ class BmsToolApp(tk.Tk):
     def _auto_poll_tick(self) -> None:
         if not self.auto_poll.get():
             return
-        if self.client.is_open and not self.worker_busy:
+        if not self.api_test_active and self.client.is_open and not self.worker_busy:
             self.read_once()
         self._schedule_auto_poll()
 
     def _schedule_summary_poll(self, delay_ms: int = SUMMARY_POLL_INTERVAL_MS) -> None:
-        if self.summary_poll_after_id is None:
+        if not self.api_test_active and self.summary_poll_after_id is None:
             self.summary_poll_after_id = self.after(delay_ms, self._summary_poll_tick)
 
     def _reschedule_summary_poll(self, delay_ms: int = SUMMARY_POLL_INTERVAL_MS) -> None:
@@ -543,6 +765,8 @@ class BmsToolApp(tk.Tk):
 
     def _summary_poll_tick(self) -> None:
         self.summary_poll_after_id = None
+        if self.api_test_active:
+            return
         if self.client.is_open and not self.worker_busy:
             self.read_summary()
         elif self.client.is_open:
@@ -608,6 +832,10 @@ class BmsToolApp(tk.Tk):
                 elif kind == "error":
                     self._log(f"ERROR: {payload}", logging.ERROR)
                     self.status_var.set(str(payload))
+                    if str(payload).startswith("api_test:"):
+                        self._show_api_result(
+                            f"[{time.strftime('%H:%M:%S')}] ERROR\n\n{payload}\n"
+                        )
                 elif kind == "ping":
                     self._log(f"Ping response: {protocol.to_hex(bytes(payload))}")
                 elif kind == "summary":
@@ -634,6 +862,26 @@ class BmsToolApp(tk.Tk):
                         self.last_summary["balance_mask"] = 0
                     self._apply_summary(self.last_summary)
                     self._log(self.balancing_status_var.get())
+                elif kind == "api_test":
+                    label = str(payload.get("label", "API"))
+                    result = payload.get("result")
+                    if isinstance(result, bytes):
+                        display = {
+                            "length": len(result),
+                            "data_hex": protocol.to_hex(result),
+                        }
+                    else:
+                        display = result
+                    formatted = json.dumps(
+                        display,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    self._show_api_result(
+                        f"[{time.strftime('%H:%M:%S')}] {label}\n\n{formatted}\n"
+                    )
+                    self._log(f"API test completed: {label}")
                 elif kind == "custom":
                     command, data = payload
                     self.custom_response_var.set(
@@ -655,6 +903,12 @@ class BmsToolApp(tk.Tk):
         message = f"Protection event: {reason_name} (0x{reason:02X})"
         self.protection_event_var.set(message)
         self.summary_note_var.set(message)
+        if self.api_test_active:
+            formatted = json.dumps(event, ensure_ascii=False, indent=2, default=str)
+            self._show_api_result(
+                f"[{time.strftime('%H:%M:%S')}] PROTECTION_EVENT (0x40)\n\n"
+                f"{formatted}\n"
+            )
         if isinstance(fault_name, str) and fault_name in self._fault_labels:
             self._fault_labels[fault_name].configure(text="ACTIVE", style="Danger.TLabel")
         self._log(message, logging.WARNING)

@@ -23,6 +23,8 @@ Set `BMS_TOOL_LOG_LEVEL=DEBUG` before running to include raw UART TX/RX frames.
   and completed cycle count (`0x14`-`0x19`).
 - Auto-poll at a configurable interval.
 - Enable or disable the balancing algorithm (`0x31`).
+- Test each protocol API independently from the **API Test** tab; periodic reads
+  pause while this tab is selected.
 - Send current calibration command (`CMD_CALIBRATE_CURRENT`, `0x30`).
 - Run OTP check/read/write commands (`0x20`, `0x22`, `0x21`).
 - Send a custom command byte with custom hex payload.
